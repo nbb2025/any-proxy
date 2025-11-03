@@ -1,4 +1,4 @@
-version: "3.8"
+version: "3.9"
 
 services:
   etcd:
@@ -15,19 +15,86 @@ services:
       - --initial-cluster=etcd0=http://etcd:2380
       - --initial-cluster-state=new
       - --initial-cluster-token=any-proxy-etcd
-    ports:
-      - "2379:2379"
-      - "2380:2380"
-    volumes:
-      - etcd-data:/etcd-data
+    environment:
+      ETCDCTL_API: "3"
     healthcheck:
-      test: ["CMD", "etcdctl", "--endpoints=http://127.0.0.1:2379", "endpoint", "health"]
+      test:
+        [
+          "CMD",
+          "etcdctl",
+          "--endpoints=http://127.0.0.1:2379",
+          "endpoint",
+          "health",
+        ]
       interval: 10s
       timeout: 5s
       retries: 5
+    ports:
+      - "${ETCD_CLIENT_PORT:-2379}:2379"
+    volumes:
+      - etcd-data:/etcd-data
+    networks:
+      - any-proxy
+
+  control-plane:
+    build:
+      context: ..
+      dockerfile: deploy/control-plane.Dockerfile
+    image: any-proxy/control-plane:local
+    depends_on:
+      etcd:
+        condition: service_healthy
+    volumes:
+      - ./configs:/configs:ro
+      - ./deploy/pki:/app/pki:ro
     environment:
-      ETCDCTL_API: "3"
+      CONTROL_PLANE_LISTEN: ${CONTROL_PLANE_LISTEN:-:8080}
+      ETCD_ENDPOINTS: ${ETCD_ENDPOINTS:-http://etcd:2379}
+      ETCD_PREFIX: ${ETCD_PREFIX:-/any-proxy/}
+      CONTROL_PLANE_SEED: ${CONTROL_PLANE_SEED:-}
+      ETCD_CERT: ${ETCD_CERT:-}
+      ETCD_KEY: ${ETCD_KEY:-}
+      ETCD_CA: ${ETCD_CA:-}
+      ETCD_INSECURE_SKIP_VERIFY: ${ETCD_INSECURE_SKIP_VERIFY:-}
+    command:
+      - /bin/sh
+      - -c
+      - >
+        exec /app/control-plane
+        -listen "$${CONTROL_PLANE_LISTEN}"
+        -etcd-endpoints "$${ETCD_ENDPOINTS}"
+        -etcd-prefix "$${ETCD_PREFIX}"
+        $${CONTROL_PLANE_SEED:+-seed $${CONTROL_PLANE_SEED}}
+        $${ETCD_CERT:+-etcd-cert $${ETCD_CERT}}
+        $${ETCD_KEY:+-etcd-key $${ETCD_KEY}}
+        $${ETCD_CA:+-etcd-ca $${ETCD_CA}}
+        $${ETCD_INSECURE_SKIP_VERIFY:+-etcd-insecure-skip-verify}
+    ports:
+      - "${CONTROL_PLANE_PORT:-8080}:8080"
+    networks:
+      - any-proxy
+
+  frontend:
+    build:
+      context: ..
+      dockerfile: deploy/frontend.Dockerfile
+      args:
+        NEXT_PUBLIC_CONTROL_PLANE_URL: ${FRONTEND_CONTROL_PLANE_URL:-http://localhost:8080}
+    image: any-proxy/frontend:local
+    depends_on:
+      control-plane:
+        condition: service_started
+    environment:
+      NEXT_PUBLIC_CONTROL_PLANE_URL: ${FRONTEND_CONTROL_PLANE_URL:-http://localhost:8080}
+      PORT: 3000
+    ports:
+      - "${FRONTEND_PORT:-3000}:3000"
+    networks:
+      - any-proxy
 
 volumes:
   etcd-data:
-    driver: local
+
+networks:
+  any-proxy:
+    driver: bridge
