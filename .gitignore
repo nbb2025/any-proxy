@@ -1,0 +1,16 @@
+.DS_Store
+bin/
+dist/
+*.log
+/tmp/
+/.idea/
+.vscode/
+coverage/
+*.exe
+*.out
+*.test
+go.work
+node_modules/
+configs/generated/
+deploy/*.crt
+deploy/*.key

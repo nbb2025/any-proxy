@@ -1,0 +1,4 @@
+name,host,ssh_user,ssh_port,data_dir,alt_names
+etcd-1,10.10.0.11,ubuntu,22,/etc/etcd/pki,"10.10.0.11;etcd-1.internal.any-proxy"
+etcd-2,10.10.0.12,ubuntu,22,/etc/etcd/pki,"10.10.0.12;etcd-2.internal.any-proxy"
+etcd-3,10.10.0.13,ubuntu,22,/etc/etcd/pki,"10.10.0.13;etcd-3.internal.any-proxy"

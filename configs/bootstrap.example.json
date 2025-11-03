@@ -1,0 +1,42 @@
+{
+  "domains": [
+    {
+      "id": "demo-edge",
+      "domain": "demo.any-proxy.local",
+      "enableTls": false,
+      "upstreams": [
+        {
+          "address": "10.0.10.15:8080",
+          "weight": 1
+        },
+        {
+          "address": "10.0.10.16:8080",
+          "weight": 1,
+          "usePersistent": true
+        }
+      ],
+      "edgeNodes": ["edge-a", "edge-b"],
+      "metadata": {
+        "sticky": true,
+        "timeoutProxy":  "5s",
+        "timeoutRead":   "30s",
+        "timeoutSend":   "30s"
+      }
+    }
+  ],
+  "tunnels": [
+    {
+      "id": "ssh-demo",
+      "protocol": "tcp",
+      "bindHost": "0.0.0.0",
+      "bindPort": 2222,
+      "target": "127.0.0.1:22",
+      "nodeIds": ["tunnel-a", "tunnel-b"],
+      "idleTimeout": "2m",
+      "metadata": {
+        "enableProxyProtocol": false,
+        "description": "SSH relay"
+      }
+    }
+  ]
+}
