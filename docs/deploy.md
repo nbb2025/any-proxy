@@ -151,6 +151,64 @@ docker compose down
 
 ---
 
+### 7.1 一键安装脚本（Linux amd64）
+
+为方便批量部署，可使用仓库新增的脚本生成一次性命令，在边缘主机直接执行即可完成安装。
+
+1. **准备静态文件服务**  
+   将仓库中的 `install/agent.sh` 暴露为 `https://anyproxy.weekeasy.com/install/agent.sh`，并把 `scripts/generate-node-command.sh` 生成的 token JSON（默认存放在 `/opt/anyproxy/install/tokens/`）一起通过 Web 服务器提供。例如 Nginx 配置示例：
+
+   ```nginx
+   location /install/ {
+     alias /opt/anyproxy/install/;
+     types { }
+     default_type application/octet-stream;
+     autoindex off;
+   }
+   ```
+
+   建议在控制平面节点上执行 `chmod +x install/agent.sh scripts/generate-node-command.sh` 后再挂载目录。
+
+2. **控制平面上生成命令**
+
+   ```bash
+   scripts/generate-node-command.sh \
+     --type edge \
+     --node edge-shanghai-01 \
+     --control-plane https://anyproxy.weekeasy.com \
+     --version v0.1.0 \
+     --ttl-min 60
+   ```
+
+   脚本会输出一次性 token，并生成一段多行安装命令。JSON token 默认写入 `/opt/anyproxy/install/tokens/<token>.json`，有效期可通过 `--ttl-min`（分钟）调整。
+   命令形如：
+
+   ```
+   curl -fsSL https://anyproxy.weekeasy.com/install/agent.sh | sudo \
+     ANYPROXY_CONTROL_PLANE=https://anyproxy.weekeasy.com \
+     ANYPROXY_NODE_TYPE=edge \
+     ANYPROXY_NODE_ID=edge-shanghai-01 \
+     ANYPROXY_TOKEN=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx \
+     ANYPROXY_VERSION=v0.1.0 \
+     bash
+   ```
+
+3. **在目标节点执行命令**
+
+   复制粘贴脚本打印的命令到目标主机（需具备 `sudo` 权限，命令通过环境变量传入 token/节点信息），安装程序会：
+   - 校验 token 是否仍然有效；
+   - 下载 `edge` 或 `tunnel` agent 二进制（路径形如 `/install/binaries/<版本>/<类型>_linux_amd64.tar.gz`，需提前上传）；
+   - 写入 `/usr/local/bin/anyproxy-<type>`；
+   - 生成 Systemd 服务文件（如 `anyproxy-edge-edge-shanghai-01.service`）并立即启动；
+   - 默认把渲染文件写到 `edge`：`/etc/nginx/conf.d/anyproxy-<node>.conf`，`tunnel`：`/etc/nginx/stream.d/anyproxy-<node>.conf`，可通过 `--output` 覆盖。
+
+   如果需要自定义 `nginx` reload 命令，可在控制端生成 token 时附加 `--reload "openresty -s reload"`，脚本会把参数透传到安装命令中。
+
+4. **Token 清理与安全**  
+   token 一次有效，过期后安装脚本会拒绝执行。可结合 `cron` 或 Systemd Timer 定期清理 `/opt/anyproxy/install/tokens/` 中早于当前时间的 JSON 文件，避免目录无限增长。
+
+---
+
 ## 8. 生产部署建议
 
 1. **etcd 集群**  

@@ -1,3 +1,4 @@
+import Link from "next/link"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Search } from "lucide-react"
@@ -55,6 +56,9 @@ export default async function EdgeNodesPage() {
           <h1 className="text-2xl font-semibold text-foreground">边缘节点</h1>
           <p className="text-sm text-muted-foreground">汇总域名与隧道引用的节点分布，辅助容量预估。</p>
         </div>
+        <Button asChild>
+          <Link href="/edge/install">部署新边缘</Link>
+        </Button>
       </header>
 
       <div className="flex-1 space-y-6 overflow-auto p-8">
