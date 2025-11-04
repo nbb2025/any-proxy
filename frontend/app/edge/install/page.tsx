@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react"
 import Link from "next/link"
-import { Linux, Server, RefreshCw, Copy, Check, Terminal, Shield, Timer, AlertCircle } from "lucide-react"
+import { Monitor, Server, RefreshCw, Copy, Check, Terminal, Shield, Timer, AlertCircle } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Textarea } from "@/components/ui/textarea"
@@ -146,7 +146,7 @@ export default function EdgeInstallPage() {
 
   const linuxCard = (
     <div className="grid w-56 place-items-center rounded-lg border border-border bg-background/60 p-6 text-center shadow-sm">
-      <Linux className="h-10 w-10 text-primary" />
+      <Monitor className="h-10 w-10 text-primary" />
       <div className="mt-3 space-y-1">
         <p className="text-base font-semibold text-foreground">Linux</p>
         <p className="text-xs text-muted-foreground">支持 x86_64 架构，需 sudo 权限</p>

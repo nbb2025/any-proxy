@@ -1,4 +1,5 @@
-import { randomUUID } from "crypto"\nimport type { ConfigSnapshot, DomainRoute, TunnelRoute, Upstream } from "./types"
+import { randomUUID } from "crypto"
+import type { ConfigSnapshot, DomainRoute, TunnelRoute, Upstream } from "./types"
 
 const CONTROL_PLANE_URL =
   process.env.NEXT_PUBLIC_CONTROL_PLANE_URL ?? process.env.CONTROL_PLANE_URL ?? "http://127.0.0.1:8080"
@@ -129,5 +130,4 @@ export async function fetchSnapshot(): Promise<ConfigSnapshot> {
     return { ...FALLBACK_SNAPSHOT, generatedAt: new Date().toISOString() }
   }
 }
-
 
