@@ -1,46 +1,7 @@
 import { randomUUID } from "crypto"
 import type { ConfigSnapshot, DomainRoute, TunnelRoute, Upstream } from "./types"
 
-const CONTROL_PLANE_URL =
-  process.env.NEXT_PUBLIC_CONTROL_PLANE_URL ?? process.env.CONTROL_PLANE_URL ?? "http://127.0.0.1:8080"
-
-const FALLBACK_SNAPSHOT: ConfigSnapshot = {
-  version: 1,
-  generatedAt: new Date().toISOString(),
-  domains: [
-    {
-      id: "demo-edge",
-      domain: "demo.any-proxy.local",
-      enableTls: false,
-      edgeNodes: ["edge-a", "edge-b"],
-      upstreams: [
-        { address: "10.0.10.15:8080", weight: 1 },
-        { address: "10.0.10.16:8080", weight: 1, usePersistent: true },
-      ],
-      metadata: {
-        sticky: true,
-        timeoutProxy: 5_000_000_000,
-        timeoutRead: 30_000_000_000,
-        timeoutSend: 30_000_000_000,
-      },
-    },
-  ],
-  tunnels: [
-    {
-      id: "ssh-demo",
-      protocol: "tcp",
-      bindHost: "0.0.0.0",
-      bindPort: 2222,
-      target: "127.0.0.1:22",
-      nodeIds: ["tunnel-a", "tunnel-b"],
-      idleTimeout: 120_000_000_000,
-      metadata: {
-        enableProxyProtocol: false,
-        description: "SSH relay",
-      },
-    },
-  ],
-}
+const CONTROL_PLANE_URL = process.env.NEXT_PUBLIC_CONTROL_PLANE_URL ?? process.env.CONTROL_PLANE_URL ?? ""
 
 function toNumber(value: unknown | undefined): number | undefined {
   if (value === null || value === undefined) return undefined
@@ -109,13 +70,20 @@ function normaliseSnapshot(raw: any): ConfigSnapshot {
   }
 }
 
-export async function fetchSnapshot(): Promise<ConfigSnapshot> {
+export async function fetchSnapshot(token: string): Promise<ConfigSnapshot> {
+  if (!CONTROL_PLANE_URL) {
+    throw new Error("control plane URL is not configured")
+  }
+  if (!token) {
+    throw new Error("access token missing")
+  }
   const baseUrl = CONTROL_PLANE_URL.replace(/\/$/, "")
   try {
     const res = await fetch(`${baseUrl}/v1/config/snapshot`, {
       cache: "no-store",
       headers: {
         Accept: "application/json",
+        Authorization: `Bearer ${token}`,
       },
     })
     if (!res.ok) {
@@ -125,9 +93,8 @@ export async function fetchSnapshot(): Promise<ConfigSnapshot> {
     return normaliseSnapshot(data)
   } catch (error) {
     if (process.env.NODE_ENV !== "production") {
-      console.warn("[frontend] failed to fetch snapshot, fallback to sample data:", error)
+      console.error("[frontend] failed to fetch snapshot:", error)
     }
-    return { ...FALLBACK_SNAPSHOT, generatedAt: new Date().toISOString() }
+    throw error
   }
 }
-

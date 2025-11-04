@@ -20,6 +20,7 @@ type EdgeOptions struct {
 	NodeID          string
 	OutputPath      string
 	TemplatePath    string
+	AuthToken       string
 	ReloadCommand   []string
 	WatchTimeout    time.Duration
 	RetryInterval   time.Duration
@@ -123,6 +124,9 @@ func (a *EdgeAgent) fetchSnapshot(ctx context.Context, since int64) (configstore
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return configstore.ConfigSnapshot{}, false, fmt.Errorf("build request: %w", err)
+	}
+	if token := strings.TrimSpace(a.opts.AuthToken); token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
 
 	resp, err := a.client.Do(req)

@@ -26,19 +26,21 @@ TOKEN="${ANYPROXY_TOKEN:-}"
 VERSION="${ANYPROXY_VERSION:-latest}"
 RELOAD_CMD="${ANYPROXY_RELOAD_CMD:-nginx -s reload}"
 OUTPUT_PATH="${ANYPROXY_OUTPUT_PATH:-}"
+AGENT_AUTH_TOKEN="${ANYPROXY_AGENT_TOKEN:-}"
 
 usage() {
   cat <<'EOF'
-Usage: agent.sh --control-plane URL --type edge|tunnel --node NODE_ID --token TOKEN [--version VERSION] [--reload CMD] [--output PATH]
+Usage: agent.sh --control-plane URL --type edge|tunnel --node NODE_ID --token TOKEN [--version VERSION] [--reload CMD] [--output PATH] [--agent-token TOKEN]
 
 Environment overrides:
   ANYPROXY_CONTROL_PLANE default control plane URL
   ANYPROXY_NODE_TYPE     default node type (edge/tunnel)
   ANYPROXY_NODE_ID       default node ID
   ANYPROXY_TOKEN         default token string
-  ANYPROXY_VERSION     default version to install (fallback: latest)
-  ANYPROXY_RELOAD_CMD  reload command for nginx/openresty (fallback: "nginx -s reload")
-  ANYPROXY_OUTPUT_PATH default config output path
+  ANYPROXY_VERSION       default version to install (fallback: latest)
+  ANYPROXY_RELOAD_CMD    reload command for nginx/openresty (fallback: "nginx -s reload")
+  ANYPROXY_OUTPUT_PATH   default config output path
+  ANYPROXY_AGENT_TOKEN   optional bearer token supplied to agent via -auth-token
 EOF
   exit 1
 }
@@ -71,6 +73,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --output)
       OUTPUT_PATH=${2:-}
+      shift 2
+      ;;
+    --agent-token)
+      AGENT_AUTH_TOKEN=${2:-}
       shift 2
       ;;
     -h|--help)
@@ -168,24 +174,35 @@ AGENT_OUTPUT_PATH=${OUTPUT_PATH:-$DEFAULT_OUTPUT}
 SERVICE_NAME="anyproxy-${NODE_TYPE}-${NODE_ID}.service"
 SERVICE_PATH="/etc/systemd/system/${SERVICE_NAME}"
 
-cat >"$SERVICE_PATH" <<EOF
-[Unit]
-Description=AnyProxy ${NODE_TYPE} agent (${NODE_ID})
-After=network-online.target
-Wants=network-online.target
+EXEC_CMD="${INSTALL_PATH}"
+EXEC_ARGS=(
+  "-control-plane" "${CONTROL_PLANE_URL}"
+  "-node-id" "${NODE_ID}"
+  "-output" "${AGENT_OUTPUT_PATH}"
+)
+if [[ -n $AGENT_AUTH_TOKEN ]]; then
+  EXEC_ARGS+=("-auth-token" "${AGENT_AUTH_TOKEN}")
+fi
+EXEC_ARGS+=("-reload" "${RELOAD_CMD}")
 
-[Service]
-ExecStart=${INSTALL_PATH} \\
-  -control-plane ${CONTROL_PLANE_URL} \\
-  -node-id ${NODE_ID} \\
-  -output ${AGENT_OUTPUT_PATH} \\
-  -reload "${RELOAD_CMD}"
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOF
+{
+  echo "[Unit]"
+  echo "Description=AnyProxy ${NODE_TYPE} agent (${NODE_ID})"
+  echo "After=network-online.target"
+  echo "Wants=network-online.target"
+  echo
+  echo "[Service]"
+  printf "ExecStart=%s" "${EXEC_CMD}"
+  for arg in "${EXEC_ARGS[@]}"; do
+    printf " \\\\\n  %s" "$arg"
+  done
+  echo
+  echo "Restart=always"
+  echo "RestartSec=5"
+  echo
+  echo "[Install]"
+  echo "WantedBy=multi-user.target"
+} >"$SERVICE_PATH"
 
 echo "[anyproxy-install] systemd unit written to ${SERVICE_PATH}"
 

@@ -1,8 +1,10 @@
 import { NextResponse } from "next/server"
+import { cookies } from "next/headers"
 import { execFile } from "node:child_process"
 import { promisify } from "node:util"
 import path from "node:path"
 import { existsSync } from "node:fs"
+import { ACCESS_COOKIE_NAME } from "@/lib/auth.server"
 
 const execFileAsync = promisify(execFile)
 
@@ -14,6 +16,7 @@ type GenerateRequest = {
   controlPlaneUrl?: string
   reloadCmd?: string
   outputPath?: string
+  agentToken?: string
 }
 
 function parseEnvOutput(raw: string): Record<string, string> {
@@ -48,6 +51,7 @@ export async function POST(request: Request) {
   const version = payload.version?.trim()
   const reloadCmd = payload.reloadCmd?.trim()
   const outputPath = payload.outputPath?.trim()
+  const agentToken = payload.agentToken?.trim()
   const ttlCandidate = Number.parseInt(String(payload.ttlMinutes ?? 30), 10)
   const ttlMinutes = Number.isFinite(ttlCandidate) ? Math.max(5, Math.min(ttlCandidate, 720)) : 30
 
@@ -65,11 +69,17 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "generate-node-command.sh not found" }, { status: 500 })
   }
 
+  const accessToken = cookies().get(ACCESS_COOKIE_NAME)?.value
+  if (!accessToken) {
+    return NextResponse.json({ error: "unauthorized" }, { status: 401 })
+  }
+
   const controlPlaneUrl =
     payload.controlPlaneUrl?.trim() ??
     process.env.INSTALL_CONTROL_PLANE_URL ??
     process.env.NEXT_PUBLIC_CONTROL_PLANE_URL ??
-    "https://anyproxy.weekeasy.com"
+    process.env.CONTROL_PLANE_URL ??
+    ""
 
   const args = ["--type", nodeType, "--node", nodeId, "--format", "env", "--ttl-min", String(ttlMinutes)]
   if (version) {
@@ -83,6 +93,9 @@ export async function POST(request: Request) {
   }
   if (controlPlaneUrl) {
     args.push("--control-plane", controlPlaneUrl)
+  }
+  if (agentToken) {
+    args.push("--agent-token", agentToken)
   }
 
   const execEnv = {
@@ -98,6 +111,9 @@ export async function POST(request: Request) {
   }
   if (controlPlaneUrl) {
     execEnv.CONTROL_PLANE_URL = controlPlaneUrl
+  }
+  if (agentToken) {
+    execEnv.ANYPROXY_AGENT_TOKEN = agentToken
   }
 
   try {
@@ -129,6 +145,7 @@ export async function POST(request: Request) {
       version: data.VERSION ?? version ?? null,
       reloadCmd: data.RELOAD_CMD ?? reloadCmd ?? null,
       outputPath: data.OUTPUT_PATH ?? outputPath ?? null,
+      agentToken: data.AGENT_TOKEN ?? agentToken ?? null,
       ttlMinutes,
     })
   } catch (error: any) {

@@ -33,6 +33,7 @@ VERSION="${ANYPROXY_VERSION:-latest}"
 RELOAD_CMD="${ANYPROXY_RELOAD_CMD:-}"
 OUTPUT_PATH="${ANYPROXY_OUTPUT_PATH:-}"
 OUTPUT_FORMAT="${ANYPROXY_OUTPUT_FMT:-text}"
+AGENT_TOKEN="${ANYPROXY_AGENT_TOKEN:-}"
 
 usage() {
   cat <<'EOF'
@@ -45,6 +46,7 @@ Options:
   --version VERSION     Agent version tag (default: env ANYPROXY_VERSION or "latest")
   --reload CMD          Override reload command passed to installer (default: env ANYPROXY_RELOAD_CMD)
   --output PATH         Override agent --output path passed to installer
+  --agent-token TOKEN   Embed control-plane bearer token for agents (default: env ANYPROXY_AGENT_TOKEN)
   --format text|env     Output style (default: text; env for machine parsing)
 
 Environment:
@@ -54,6 +56,7 @@ Environment:
   ANYPROXY_RELOAD_CMD   Default reload command
   ANYPROXY_OUTPUT_PATH  Default output path override
   ANYPROXY_OUTPUT_FMT   Default format (text/env)
+  ANYPROXY_AGENT_TOKEN  Default agent bearer token
 EOF
   exit 1
 }
@@ -94,6 +97,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --output)
       OUTPUT_PATH=${2:-}
+      shift 2
+      ;;
+    --agent-token)
+      AGENT_TOKEN=${2:-}
       shift 2
       ;;
     -h|--help)
@@ -158,6 +165,9 @@ fi
 if [[ -n $OUTPUT_PATH ]]; then
   CMD+=" ANYPROXY_OUTPUT_PATH=$(escape "${OUTPUT_PATH}")"
 fi
+if [[ -n $AGENT_TOKEN ]]; then
+  CMD+=" ANYPROXY_AGENT_TOKEN=$(escape "${AGENT_TOKEN}")"
+fi
 
 CMD+=" bash"
 
@@ -174,6 +184,7 @@ if [[ "$OUTPUT_FORMAT" == "env" ]]; then
     printf 'VERSION=%s\n' "$VERSION"
     printf 'RELOAD_CMD=%s\n' "$RELOAD_CMD"
     printf 'OUTPUT_PATH=%s\n' "$OUTPUT_PATH"
+    printf 'AGENT_TOKEN=%s\n' "$AGENT_TOKEN"
   }
   exit 0
 fi

@@ -18,6 +18,7 @@ func main() {
 		nodeID       = flag.String("node-id", "", "Unique identifier for this tunnel node")
 		outputPath   = flag.String("output", "/usr/local/openresty/nginx/conf/stream.conf", "Path to render nginx stream config")
 		templatePath = flag.String("template", "", "Optional custom template path")
+		authToken    = flag.String("auth-token", "", "Optional bearer token used to authenticate against control plane")
 		reloadCmdRaw = flag.String("reload", "openresty -s reload", "Command used to reload nginx/openresty (space separated)")
 		dryRun       = flag.Bool("dry-run", false, "Render config but skip reload commands")
 	)
@@ -31,6 +32,7 @@ func main() {
 		NodeID:          *nodeID,
 		OutputPath:      *outputPath,
 		TemplatePath:    *templatePath,
+		AuthToken:       *authToken,
 		ReloadCommand:   reloadArgs,
 		Logger:          logger,
 		DryRun:          *dryRun,

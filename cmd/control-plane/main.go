@@ -19,6 +19,7 @@ import (
 	clientv3 "go.etcd.io/etcd/client/v3"
 
 	"anyproxy.dev/any-proxy/internal/api"
+	"anyproxy.dev/any-proxy/internal/auth"
 	"anyproxy.dev/any-proxy/internal/configstore"
 )
 
@@ -100,17 +101,41 @@ func main() {
 		logger.Printf("seed configuration loaded from %s", *seedPath)
 	}
 
-	mux := http.NewServeMux()
 	opts := []api.Option{api.WithLogger(logger)}
 	if healthFn != nil {
 		opts = append(opts, api.WithHealthCheck(healthFn))
 	}
 	apiServer := api.NewServer(store, opts...)
-	apiServer.Register(mux)
+
+	authCfg, err := auth.LoadConfigFromEnv()
+	if err != nil {
+		logger.Fatalf("auth configuration error: %v", err)
+	}
+	authMgr, err := auth.NewManager(authCfg)
+	if err != nil {
+		logger.Fatalf("auth manager setup failed: %v", err)
+	}
+
+	protectedMux := http.NewServeMux()
+	apiServer.Register(protectedMux)
+
+	rootMux := http.NewServeMux()
+	rootMux.Handle("/auth/login", auth.LoginHandler(authMgr))
+	rootMux.Handle("/auth/refresh", auth.RefreshHandler(authMgr))
+
+	authenticatedHandler := auth.Middleware(
+		protectedMux,
+		authMgr,
+		auth.WithSkip("GET", "/healthz"),
+		auth.WithSkip("GET", "/install/"),
+		auth.WithSkip("GET", "/install/*"),
+		auth.WithSkip("GET", "/agent/healthz"),
+	)
+	rootMux.Handle("/", authenticatedHandler)
 
 	server := &http.Server{
 		Addr:              *listenAddr,
-		Handler:           loggingMiddleware(logger, mux),
+		Handler:           loggingMiddleware(logger, rootMux),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
