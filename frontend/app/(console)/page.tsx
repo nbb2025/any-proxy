@@ -2,6 +2,7 @@ import { redirect } from "next/navigation"
 import { Button } from "@/components/ui/button"
 import { RefreshCcw } from "lucide-react"
 import { DashboardMetrics } from "@/components/dashboard/metrics"
+import { DashboardOverview } from "@/components/dashboard/overview"
 import { DomainsTable } from "@/components/dashboard/domains-table"
 import { TunnelsTable } from "@/components/dashboard/tunnels-table"
 import { fetchSnapshot } from "@/lib/api"
@@ -65,7 +66,8 @@ export default async function DashboardPage() {
         </Button>
       </header>
 
-      <div className="flex-1 space-y-6 overflow-auto p-8">
+      <div className="flex-1 space-y-6 overflow-auto bg-[#05070d] px-8 py-10">
+        <DashboardOverview />
         <DashboardMetrics metrics={metrics} version={snapshot.version} generatedAt={snapshot.generatedAt} />
 
         <section className="space-y-4">
