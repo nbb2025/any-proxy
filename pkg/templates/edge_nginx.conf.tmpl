@@ -14,6 +14,8 @@ http {
     server_tokens off;
 
 {{- range .Domains }}
+    {{- $sslPolicy := sslPolicyFor $.SSLPolicies .AccountID }}
+    {{- $cert := certificateFor $.Certificates .AccountID }}
     upstream {{ .UpstreamName }} {
 {{- range .Upstreams }}
         server {{ .Address }}{{ if .Weight }} weight={{ .Weight }}{{ end }}{{ if .MaxFails }} max_fails={{ .MaxFails }}{{ end }}{{ if .FailTimeout }} fail_timeout={{ .FailTimeout }}{{ end }};
@@ -30,12 +32,35 @@ http {
         listen 80;
 {{- if .EnableTLS }}
         listen 443 ssl http2;
-        ssl_certificate     /etc/any-proxy/tls/{{ .Domain }}.crt;
-        ssl_certificate_key /etc/any-proxy/tls/{{ .Domain }}.key;
+{{- if $cert }}
+        ssl_certificate     {{ $cert.CertificatePath }};
+        ssl_certificate_key {{ $cert.KeyPath }};
+{{- end }}
 {{- end }}
 
         server_name {{ .Domain }};
         access_log /var/log/nginx/{{ .Domain }}.access.log main;
+
+{{- if $sslPolicy }}
+{{- if $sslPolicy.EnforceHTTPS }}
+        if ($scheme = http) {
+            return 301 https://$host$request_uri;
+        }
+{{- end }}
+{{- if $sslPolicy.EnableHSTS }}
+        add_header Strict-Transport-Security "max-age={{ hstsSeconds $sslPolicy.HSTSMaxAge }}{{ if $sslPolicy.HSTSIncludeSubdomains }}; includeSubDomains{{ end }}{{ if $sslPolicy.HSTSPreload }}; preload{{ end }}" always;
+{{- end }}
+{{- if $sslPolicy.MinTLSVersion }}
+        ssl_protocols {{ tlsProtocols $sslPolicy.MinTLSVersion }};
+{{- end }}
+{{- if $sslPolicy.EnableOCSPStapling }}
+        ssl_stapling on;
+        ssl_stapling_verify on;
+{{- end }}
+{{- if $sslPolicy.ClientAuth }}
+        ssl_verify_client on;
+{{- end }}
+{{- end }}
 
 {{- if .Sticky }}
         sticky cookie srv_id expires=1h path=/;
@@ -62,3 +87,4 @@ http {
     }
 {{- end }}
 }
+
