@@ -378,8 +378,13 @@ export default function EdgeInstallPage() {
           </div>
 
           <ul className="ml-12 list-disc space-y-2 text-sm text-muted-foreground">
-            <li>脚本会生成 `anyproxy-{edge|tunnel}-{节点ID}.service`，确保服务状态为 active。</li>
-            <li>如需卸载，可执行 `sudo systemctl disable --now anyproxy-{edge|tunnel}-{节点ID}` 并删除对应配置文件。</li>
+            <li>
+              脚本会生成 <code>{`anyproxy-{edge|tunnel}-{节点ID}.service`}</code>，确保服务状态为 active。
+            </li>
+            <li>
+              如需卸载，可执行{" "}
+              <code>{`sudo systemctl disable --now anyproxy-{edge|tunnel}-{节点ID}`}</code> 并删除对应配置文件。
+            </li>
             <li>
               建议为生产节点配置监控：systemd 服务存活、`/var/log/` 中的 agent 日志、Nginx worker 状态等指标。
             </li>
