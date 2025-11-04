@@ -1,6 +1,9 @@
 package templates
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // EdgeTemplateData is rendered into nginx.conf for HTTP/S routing.
 type EdgeTemplateData struct {
@@ -89,6 +92,43 @@ type PolicyScope struct {
 	Mode      string
 	Resources []string
 	Tags      []string
+}
+
+// AppliesToDomain reports whether the scope should apply to the given domain/account id.
+// Optional aliases (e.g. domain names) are also considered when matching resources.
+func (s PolicyScope) AppliesToDomain(accountID string, aliases ...string) bool {
+	mode := strings.TrimSpace(strings.ToLower(s.Mode))
+	switch mode {
+	case "", "any":
+		return true
+	case "resources":
+		candidates := append([]string{accountID}, aliases...)
+		hasCandidate := false
+		for i := range candidates {
+			candidates[i] = strings.ToLower(strings.TrimSpace(candidates[i]))
+			if candidates[i] != "" {
+				hasCandidate = true
+			}
+		}
+		if !hasCandidate {
+			return false
+		}
+		for _, resource := range s.Resources {
+			target := strings.ToLower(strings.TrimSpace(resource))
+			if target == "" {
+				continue
+			}
+			for _, candidate := range candidates {
+				if candidate != "" && candidate == target {
+					return true
+				}
+			}
+		}
+	case "tags":
+		// Tag-based matching is not yet implemented on the edge template.
+		return false
+	}
+	return false
 }
 
 // Matcher represents a single condition.

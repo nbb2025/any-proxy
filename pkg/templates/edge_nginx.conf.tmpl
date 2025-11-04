@@ -14,7 +14,7 @@ http {
     server_tokens off;
 
 {{- range .Domains }}
-    {{- $sslPolicy := sslPolicyFor $.SSLPolicies .AccountID }}
+    {{- $sslPolicy := sslPolicyFor $.SSLPolicies . }}
     {{- $cert := certificateFor $.Certificates .AccountID }}
     upstream {{ .UpstreamName }} {
 {{- range .Upstreams }}
@@ -34,7 +34,9 @@ http {
         listen 443 ssl http2;
 {{- if $cert }}
         ssl_certificate     {{ $cert.CertificatePath }};
+{{- if $cert.KeyPath }}
         ssl_certificate_key {{ $cert.KeyPath }};
+{{- end }}
 {{- end }}
 {{- end }}
 
@@ -87,4 +89,3 @@ http {
     }
 {{- end }}
 }
-

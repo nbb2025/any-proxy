@@ -26,11 +26,13 @@ TOKEN="${ANYPROXY_TOKEN:-}"
 VERSION="${ANYPROXY_VERSION:-latest}"
 RELOAD_CMD="${ANYPROXY_RELOAD_CMD:-nginx -s reload}"
 OUTPUT_PATH="${ANYPROXY_OUTPUT_PATH:-}"
+CERT_DIR="${ANYPROXY_CERT_DIR:-}"
+CLIENT_CA_DIR="${ANYPROXY_CLIENT_CA_DIR:-}"
 AGENT_AUTH_TOKEN="${ANYPROXY_AGENT_TOKEN:-}"
 
 usage() {
   cat <<'EOF'
-Usage: agent.sh --control-plane URL --type edge|tunnel --node NODE_ID --token TOKEN [--version VERSION] [--reload CMD] [--output PATH] [--agent-token TOKEN]
+Usage: agent.sh --control-plane URL --type edge|tunnel --node NODE_ID --token TOKEN [--version VERSION] [--reload CMD] [--output PATH] [--cert-dir PATH] [--client-ca-dir PATH] [--agent-token TOKEN]
 
 Environment overrides:
   ANYPROXY_CONTROL_PLANE default control plane URL
@@ -40,6 +42,8 @@ Environment overrides:
   ANYPROXY_VERSION       default version to install (fallback: latest)
   ANYPROXY_RELOAD_CMD    reload command for nginx/openresty (fallback: "nginx -s reload")
   ANYPROXY_OUTPUT_PATH   default config output path
+  ANYPROXY_CERT_DIR      default certificate directory passed to agent
+  ANYPROXY_CLIENT_CA_DIR client CA bundle directory passed to agent
   ANYPROXY_AGENT_TOKEN   optional bearer token supplied to agent via -auth-token
 EOF
   exit 1
@@ -73,6 +77,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --output)
       OUTPUT_PATH=${2:-}
+      shift 2
+      ;;
+    --cert-dir)
+      CERT_DIR=${2:-}
+      shift 2
+      ;;
+    --client-ca-dir)
+      CLIENT_CA_DIR=${2:-}
       shift 2
       ;;
     --agent-token)
@@ -182,6 +194,12 @@ EXEC_ARGS=(
 )
 if [[ -n $AGENT_AUTH_TOKEN ]]; then
   EXEC_ARGS+=("-auth-token" "${AGENT_AUTH_TOKEN}")
+fi
+if [[ -n $CERT_DIR ]]; then
+  EXEC_ARGS+=("-cert-dir" "${CERT_DIR}")
+fi
+if [[ -n $CLIENT_CA_DIR ]]; then
+  EXEC_ARGS+=("-client-ca-dir" "${CLIENT_CA_DIR}")
 fi
 EXEC_ARGS+=("-reload" "${RELOAD_CMD}")
 

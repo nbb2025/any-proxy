@@ -17,6 +17,8 @@ func main() {
 		controlPlane = flag.String("control-plane", "http://127.0.0.1:8080", "Control plane base URL")
 		nodeID       = flag.String("node-id", "", "Unique identifier for this edge node")
 		outputPath   = flag.String("output", "/usr/local/openresty/nginx/conf/nginx.conf", "Path to render nginx HTTP config")
+		certDir      = flag.String("cert-dir", "", "Directory to store edge TLS certificates (defaults to <output>/../certs)")
+		clientCADir  = flag.String("client-ca-dir", "", "Directory to store client CA bundles (defaults to cert-dir)")
 		templatePath = flag.String("template", "", "Optional custom template path")
 		authToken    = flag.String("auth-token", "", "Optional bearer token used to authenticate against control plane")
 		reloadCmdRaw = flag.String("reload", "openresty -s reload", "Command used to reload nginx/openresty (space separated)")
@@ -32,6 +34,8 @@ func main() {
 		ControlPlaneURL: *controlPlane,
 		NodeID:          *nodeID,
 		OutputPath:      *outputPath,
+		CertificateDir:  *certDir,
+		ClientCADir:     *clientCADir,
 		TemplatePath:    *templatePath,
 		AuthToken:       *authToken,
 		ReloadCommand:   reloadArgs,

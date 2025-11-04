@@ -1,11 +1,15 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -19,6 +23,8 @@ type EdgeOptions struct {
 	ControlPlaneURL string
 	NodeID          string
 	OutputPath      string
+	CertificateDir  string
+	ClientCADir     string
 	TemplatePath    string
 	AuthToken       string
 	ReloadCommand   []string
@@ -65,8 +71,21 @@ func NewEdgeAgent(opts EdgeOptions) (*EdgeAgent, error) {
 	opts.WatchTimeout = defaultDuration(opts.WatchTimeout, 55*time.Second)
 	opts.RetryInterval = defaultDuration(opts.RetryInterval, 5*time.Second)
 
-	if err := templates.EnsureDir(filepath.Dir(opts.OutputPath)); err != nil {
+	outputDir := filepath.Dir(opts.OutputPath)
+	if err := templates.EnsureDir(outputDir); err != nil {
 		return nil, fmt.Errorf("ensure output dir: %w", err)
+	}
+	if strings.TrimSpace(opts.CertificateDir) == "" {
+		opts.CertificateDir = filepath.Join(outputDir, "certs")
+	}
+	if err := templates.EnsureDir(opts.CertificateDir); err != nil {
+		return nil, fmt.Errorf("ensure certificate dir: %w", err)
+	}
+	if strings.TrimSpace(opts.ClientCADir) == "" {
+		opts.ClientCADir = opts.CertificateDir
+	}
+	if err := templates.EnsureDir(opts.ClientCADir); err != nil {
+		return nil, fmt.Errorf("ensure client CA dir: %w", err)
 	}
 
 	return &EdgeAgent{
@@ -155,7 +174,12 @@ func (a *EdgeAgent) fetchSnapshot(ctx context.Context, since int64) (configstore
 }
 
 func (a *EdgeAgent) applySnapshot(ctx context.Context, snap configstore.ConfigSnapshot) error {
-	data := transformEdgeSnapshot(snap, a.opts.NodeID)
+	certMaterials, clientCAPaths, err := a.materialiseCertificates(snap.Certificates)
+	if err != nil {
+		return fmt.Errorf("materialise certificates: %w", err)
+	}
+
+	data := transformEdgeSnapshot(snap, a.opts.NodeID, certMaterials, clientCAPaths)
 	if len(data.Domains) == 0 {
 		a.logger.Printf("[edge] no domains assigned to node %s, writing placeholder", a.opts.NodeID)
 	}
@@ -181,12 +205,75 @@ func (a *EdgeAgent) applySnapshot(ctx context.Context, snap configstore.ConfigSn
 	return nil
 }
 
-func transformEdgeSnapshot(snap configstore.ConfigSnapshot, nodeID string) templates.EdgeTemplateData {
-	out := templates.EdgeTemplateData{
-		NodeID:  nodeID,
-		Version: snap.Version,
+func (a *EdgeAgent) materialiseCertificates(certs []configstore.Certificate) (map[string]templates.CertificateMaterial, map[string]string, error) {
+	certMaterials := make(map[string]templates.CertificateMaterial)
+	clientCAs := make(map[string]string)
+	usedNames := make(map[string]int)
+
+	for idx, cert := range certs {
+		base := sanitizeID(cert.ID)
+		if base == "default" || base == "" {
+			base = sanitizeID(cert.Name)
+		}
+		if base == "default" || base == "" {
+			base = fmt.Sprintf("cert%d", idx+1)
+		}
+		name := makeUniqueName(base, usedNames)
+
+		pem := strings.TrimSpace(cert.PEM)
+		key := strings.TrimSpace(cert.PrivateKey)
+
+		if pem == "" && key == "" {
+			continue
+		}
+		if pem == "" {
+			a.logger.Printf("[edge] certificate id=%s name=%s missing PEM, skipping materialisation", cert.ID, cert.Name)
+			continue
+		}
+
+		pemBytes := []byte(pem + "\n")
+
+		certPath := filepath.Join(a.opts.CertificateDir, name+".crt")
+		if err := writeFileIfChanged(certPath, pemBytes, 0o644); err != nil {
+			return nil, nil, fmt.Errorf("write certificate %s: %w", cert.ID, err)
+		}
+
+		caPath := certPath
+		if filepath.Clean(a.opts.ClientCADir) != filepath.Clean(a.opts.CertificateDir) {
+			caPath = filepath.Join(a.opts.ClientCADir, name+".pem")
+			if err := writeFileIfChanged(caPath, pemBytes, 0o644); err != nil {
+				return nil, nil, fmt.Errorf("write client CA %s: %w", cert.ID, err)
+			}
+		}
+		clientCAs[cert.ID] = caPath
+
+		if key != "" {
+			keyPath := filepath.Join(a.opts.CertificateDir, name+".key")
+			if err := writeFileIfChanged(keyPath, []byte(key+"\n"), 0o600); err != nil {
+				return nil, nil, fmt.Errorf("write private key %s: %w", cert.ID, err)
+			}
+			certMaterials[cert.ID] = templates.CertificateMaterial{
+				CertificatePath: certPath,
+				KeyPath:         keyPath,
+			}
+		} else {
+			if !cert.Managed {
+				a.logger.Printf("[edge] certificate id=%s name=%s missing private key, cannot be used for TLS termination", cert.ID, cert.Name)
+			}
+		}
 	}
 
+	return certMaterials, clientCAs, nil
+}
+
+func transformEdgeSnapshot(snap configstore.ConfigSnapshot, nodeID string, certMaterials map[string]templates.CertificateMaterial, clientCAs map[string]string) templates.EdgeTemplateData {
+	out := templates.EdgeTemplateData{
+		NodeID:       nodeID,
+		Version:      snap.Version,
+		Certificates: make(map[string]templates.CertificateMaterial),
+	}
+
+	domainIndex := make(map[string]configstore.DomainRoute)
 	for _, route := range snap.Domains {
 		if !routeAssigned(route.EdgeNodes, nodeID) {
 			continue
@@ -222,6 +309,112 @@ func transformEdgeSnapshot(snap configstore.ConfigSnapshot, nodeID string) templ
 			EnablePersist: enablePersist,
 			Upstreams:     upstreams,
 		})
+		domainIndex[route.ID] = route
+	}
+
+	if len(domainIndex) == 0 {
+		return out
+	}
+
+	for _, policy := range snap.SSLPolicies {
+		tplPolicy := templates.SSLPolicy{
+			ID:                    policy.ID,
+			Name:                  policy.Name,
+			Description:           policy.Description,
+			Scope:                 toTemplateScope(policy.Scope),
+			EnforceHTTPS:          policy.EnforceHTTPS,
+			EnableHSTS:            policy.EnableHSTS,
+			HSTSMaxAge:            policy.HSTSMaxAge,
+			HSTSIncludeSubdomains: policy.HSTSIncludeSubdomains,
+			HSTSPreload:           policy.HSTSPreload,
+			MinTLSVersion:         policy.MinTLSVersion,
+			EnableOCSPStapling:    policy.EnableOCSPStapling,
+			ClientAuth:            policy.ClientAuth,
+		}
+
+		matched := false
+		for domainID, route := range domainIndex {
+			if tplPolicy.Scope.AppliesToDomain(domainID, route.Domain) {
+				matched = true
+				if policy.CertificateID != "" {
+					if material, ok := certMaterials[policy.CertificateID]; ok {
+						if _, exists := out.Certificates[domainID]; !exists {
+							out.Certificates[domainID] = material
+						}
+					}
+				}
+			}
+		}
+		if !matched {
+			continue
+		}
+
+		if len(policy.ClientCAIDs) > 0 {
+			caPaths := make([]string, 0, len(policy.ClientCAIDs))
+			for _, caID := range policy.ClientCAIDs {
+				if caPath, ok := clientCAs[caID]; ok {
+					caPaths = append(caPaths, caPath)
+				}
+			}
+			tplPolicy.ClientCAPaths = caPaths
+		}
+
+		out.SSLPolicies = append(out.SSLPolicies, tplPolicy)
+	}
+
+	for _, policy := range snap.AccessPolicies {
+		scope := toTemplateScope(policy.Scope)
+		matched := false
+		for domainID, route := range domainIndex {
+			if scope.AppliesToDomain(domainID, route.Domain) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			continue
+		}
+
+		access := templates.AccessPolicy{
+			ID:           policy.ID,
+			Name:         policy.Name,
+			Description:  policy.Description,
+			Scope:        scope,
+			Action:       string(policy.Action),
+			ResponseCode: policy.ResponseCode,
+			RedirectURL:  policy.RedirectURL,
+		}
+		if strings.EqualFold(policy.Condition.Mode, "matchers") {
+			access.Matchers = toTemplateMatchers(policy.Condition.Matchers)
+		}
+		out.AccessPolicies = append(out.AccessPolicies, access)
+	}
+
+	for _, rule := range snap.RewriteRules {
+		scope := toTemplateScope(rule.Scope)
+		matched := false
+		for domainID, route := range domainIndex {
+			if scope.AppliesToDomain(domainID, route.Domain) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			continue
+		}
+
+		rewrite := templates.RewriteRule{
+			ID:          rule.ID,
+			Name:        rule.Name,
+			Description: rule.Description,
+			Scope:       scope,
+			Actions:     toTemplateRewriteActions(rule.Actions),
+			Priority:    rule.Priority,
+		}
+		if strings.EqualFold(rule.Condition.Mode, "matchers") {
+			rewrite.Matchers = toTemplateMatchers(rule.Condition.Matchers)
+		}
+		out.RewriteRules = append(out.RewriteRules, rewrite)
 	}
 
 	return out
@@ -266,4 +459,121 @@ func formatDuration(d time.Duration) string {
 		return ""
 	}
 	return d.String()
+}
+
+func toTemplateScope(scope configstore.PolicyScope) templates.PolicyScope {
+	return templates.PolicyScope{
+		Mode:      scope.Mode,
+		Resources: append([]string(nil), scope.Resources...),
+		Tags:      append([]string(nil), scope.Tags...),
+	}
+}
+
+func toTemplateMatchers(matchers []configstore.Matcher) []templates.Matcher {
+	if len(matchers) == 0 {
+		return nil
+	}
+	out := make([]templates.Matcher, 0, len(matchers))
+	for _, matcher := range matchers {
+		out = append(out, templates.Matcher{
+			Type:     matcher.Type,
+			Key:      matcher.Key,
+			Operator: matcher.Operator,
+			Values:   append([]string(nil), matcher.Values...),
+		})
+	}
+	return out
+}
+
+func toTemplateRewriteActions(actions configstore.RewriteActions) templates.RewriteActions {
+	result := templates.RewriteActions{
+		SNIOverride:  actions.SNIOverride,
+		HostOverride: actions.HostOverride,
+	}
+	if actions.URL != (configstore.URLRewrite{}) {
+		result.URL = templates.URLRewrite{
+			Mode:  actions.URL.Mode,
+			Path:  actions.URL.Path,
+			Query: actions.URL.Query,
+		}
+	}
+	if len(actions.Headers) > 0 {
+		headers := make([]templates.HeaderMutation, 0, len(actions.Headers))
+		for _, h := range actions.Headers {
+			headers = append(headers, templates.HeaderMutation{
+				Operation: h.Operation,
+				Name:      h.Name,
+				Value:     h.Value,
+			})
+		}
+		result.Headers = headers
+	}
+	if actions.Upstream != nil {
+		result.Upstream = &templates.UpstreamOverride{
+			PassHostHeader: actions.Upstream.PassHostHeader,
+			UpstreamHost:   actions.Upstream.UpstreamHost,
+			Scheme:         actions.Upstream.Scheme,
+			ConnectTimeout: actions.Upstream.ConnectTimeout,
+			ReadTimeout:    actions.Upstream.ReadTimeout,
+			SendTimeout:    actions.Upstream.SendTimeout,
+		}
+	}
+	return result
+}
+
+func makeUniqueName(base string, used map[string]int) string {
+	name := base
+	if name == "" {
+		name = "cert"
+	}
+	if count, ok := used[name]; ok {
+		count++
+		used[name] = count
+		return fmt.Sprintf("%s_%d", name, count)
+	}
+	used[name] = 0
+	return name
+}
+
+func writeFileIfChanged(path string, data []byte, perm fs.FileMode) error {
+	existing, err := os.ReadFile(path)
+	if err == nil {
+		if bytes.Equal(existing, data) {
+			return os.Chmod(path, perm)
+		}
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	return writeFileAtomic(path, data, perm)
+}
+
+func writeFileAtomic(path string, data []byte, perm fs.FileMode) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(perm); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+
+	if err := os.Rename(tmp.Name(), path); err != nil {
+		return err
+	}
+
+	return os.Chmod(path, perm)
 }

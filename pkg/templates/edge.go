@@ -46,9 +46,9 @@ func certificateFor(certs map[string]CertificateMaterial, accountID string) *Cer
 	return nil
 }
 
-func sslPolicyFor(policies []SSLPolicy, accountID string) *SSLPolicy {
+func sslPolicyFor(policies []SSLPolicy, domain EdgeDomain) *SSLPolicy {
 	for _, policy := range policies {
-		if policy.Scope.AppliesToDomain(accountID) {
+		if policy.Scope.AppliesToDomain(domain.AccountID, domain.Domain) {
 			return &policy
 		}
 	}
