@@ -1,23 +1,53 @@
-import { redirect } from "next/navigation"
-import { fetchSnapshot } from "@/lib/api"
+'use client'
+
+import { useMemo } from "react"
+import { Button } from "@/components/ui/button"
+import { useSnapshot } from "@/hooks/use-snapshot"
 import { PolicySummary } from "@/components/policy/policy-summary"
 import { SSLPolicyList } from "@/components/policy/ssl-policy-list"
 import { AccessPolicyList } from "@/components/policy/access-policy-list"
 import { RewriteRuleList } from "@/components/policy/rewrite-rule-list"
-import { requireAccessToken } from "@/lib/auth.server"
 
-export default async function PolicyPage() {
-  const token = requireAccessToken()
-  let snapshot
-  try {
-    snapshot = await fetchSnapshot(token)
-  } catch (error) {
-    console.error("[policy] fetch snapshot failed", error)
-    redirect("/login")
+export default function PolicyPage() {
+  const { snapshot, loading, error, reload } = useSnapshot()
+
+  const derived = useMemo(() => {
+    if (!snapshot) {
+      return {
+        certificatesById: {},
+        domainNamesById: {},
+      } as {
+        certificatesById: Record<string, (typeof snapshot)["certificates"][number]>
+        domainNamesById: Record<string, string>
+      }
+    }
+    const certificatesById = Object.fromEntries(snapshot.certificates.map((item) => [item.id, item]))
+    const domainNamesById = Object.fromEntries(snapshot.domains.map((item) => [item.id, item.domain]))
+    return { certificatesById, domainNamesById }
+  }, [snapshot])
+
+  if (loading) {
+    return (
+      <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
+        正在加载策略数据...
+      </div>
+    )
   }
 
-  const certificatesById = Object.fromEntries(snapshot.certificates.map((item) => [item.id, item]))
-  const domainNamesById = Object.fromEntries(snapshot.domains.map((item) => [item.id, item.domain]))
+  if (error) {
+    return (
+      <div className="flex h-full flex-col items-center justify-center gap-3 text-sm text-muted-foreground">
+        <p>加载策略数据失败：{error}</p>
+        <Button variant="outline" onClick={reload}>
+          重试
+        </Button>
+      </div>
+    )
+  }
+
+  if (!snapshot) {
+    return null
+  }
 
   return (
     <div className="flex h-full flex-col">
@@ -47,8 +77,8 @@ export default async function PolicyPage() {
           </div>
           <SSLPolicyList
             policies={snapshot.sslPolicies}
-            certificatesById={certificatesById}
-            domainNamesById={domainNamesById}
+            certificatesById={derived.certificatesById}
+            domainNamesById={derived.domainNamesById}
           />
         </section>
 
@@ -59,7 +89,7 @@ export default async function PolicyPage() {
               基于请求来源、路径、Header 等条件执行允许或拒绝策略，保护回源服务。
             </p>
           </div>
-          <AccessPolicyList policies={snapshot.accessPolicies} domainNamesById={domainNamesById} />
+          <AccessPolicyList policies={snapshot.accessPolicies} domainNamesById={derived.domainNamesById} />
         </section>
 
         <section className="space-y-4">
@@ -69,7 +99,7 @@ export default async function PolicyPage() {
               在边缘节点内灵活改写 Host、SNI、URL、Header 或上游协议，满足复杂回源需求。
             </p>
           </div>
-          <RewriteRuleList rules={snapshot.rewriteRules} domainNamesById={domainNamesById} />
+          <RewriteRuleList rules={snapshot.rewriteRules} domainNamesById={derived.domainNamesById} />
         </section>
       </div>
     </div>

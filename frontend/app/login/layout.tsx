@@ -1,12 +1,19 @@
+'use client'
+
 import type { ReactNode } from "react"
-import { cookies } from "next/headers"
-import { redirect } from "next/navigation"
-import { ACCESS_COOKIE_NAME } from "@/lib/auth.server"
+import { useEffect } from "react"
+import { useRouter } from "next/navigation"
+import { getStoredTokens } from "@/lib/auth.client"
 
 export default function LoginLayout({ children }: { children: ReactNode }) {
-  const token = cookies().get?.(ACCESS_COOKIE_NAME)?.value
-  if (token) {
-    redirect("/")
-  }
+  const router = useRouter()
+
+  useEffect(() => {
+    const tokens = getStoredTokens()
+    if (tokens?.accessToken) {
+      router.replace("/")
+    }
+  }, [router])
+
   return <>{children}</>
 }

@@ -81,16 +81,13 @@ services:
     build:
       context: ..
       dockerfile: deploy/frontend.Dockerfile
-      args:
-        NEXT_PUBLIC_CONTROL_PLANE_URL: ${FRONTEND_CONTROL_PLANE_URL:-http://localhost:8080}
     image: any-proxy/frontend:local
     depends_on:
       control-plane:
         condition: service_started
     environment:
-      NEXT_PUBLIC_CONTROL_PLANE_URL: ${FRONTEND_CONTROL_PLANE_URL:-http://localhost:8080}
-      CONTROL_PLANE_URL: ${FRONTEND_CONTROL_PLANE_URL:-http://localhost:8080}
-      CONTROL_PLANE_INTERNAL_URL: ${FRONTEND_CONTROL_PLANE_INTERNAL_URL:-http://control-plane:8080}
+      CONTROL_PLANE_API_URL: ${CONTROL_PLANE_API_URL:-http://control-plane:8080}
+      NEXT_PUBLIC_CONTROL_PLANE_URL: ${NEXT_PUBLIC_CONTROL_PLANE_URL:-}
       PORT: 3000
     networks:
       - any-proxy

@@ -1,4 +1,3 @@
-import { randomUUID } from "crypto"
 import type {
   AccessPolicy,
   Certificate,
@@ -17,12 +16,24 @@ import type {
   URLRewrite,
 } from "./types"
 
-const CONTROL_PLANE_URL =
-  (typeof window === "undefined"
-    ? process.env.CONTROL_PLANE_INTERNAL_URL ?? process.env.CONTROL_PLANE_URL
-    : process.env.NEXT_PUBLIC_CONTROL_PLANE_URL) ??
-  process.env.NEXT_PUBLIC_CONTROL_PLANE_URL ??
-  ""
+function resolveControlPlaneURL(): string {
+  if (typeof window !== "undefined") {
+    const override = (process.env.NEXT_PUBLIC_CONTROL_PLANE_URL ?? "").trim()
+    const isLocalOverride = /^https?:\/\/(localhost|127\.|0\.0\.0\.0)/i.test(override)
+    if (override && !isLocalOverride) {
+      return override
+    }
+    return window.location.origin
+  }
+  return (process.env.CONTROL_PLANE_API_URL ?? "").trim()
+}
+
+function generateId(): string {
+  if (typeof globalThis !== "undefined" && typeof globalThis.crypto?.randomUUID === "function") {
+    return globalThis.crypto.randomUUID()
+  }
+  return `id-${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`
+}
 
 function toNumber(value: unknown | undefined): number | undefined {
   if (value === null || value === undefined) return undefined
@@ -73,7 +84,7 @@ function normaliseCondition(raw: any): Condition {
 
 function normaliseCertificate(raw: any): Certificate {
   return {
-    id: String(raw?.id ?? randomUUID()),
+    id: String(raw?.id ?? generateId()),
     name: String(raw?.name ?? ""),
     description: toStringValue(raw?.description),
     domains: toStringArray(raw?.domains),
@@ -90,7 +101,7 @@ function normaliseCertificate(raw: any): Certificate {
 
 function normaliseSSLPolicy(raw: any): SSLPolicy {
   return {
-    id: String(raw?.id ?? randomUUID()),
+    id: String(raw?.id ?? generateId()),
     name: String(raw?.name ?? ""),
     description: toStringValue(raw?.description),
     scope: normaliseScope(raw?.scope),
@@ -113,7 +124,7 @@ function normaliseSSLPolicy(raw: any): SSLPolicy {
 function normaliseAccessPolicy(raw: any): AccessPolicy {
   const action = toStringValue(raw?.action)?.toLowerCase() ?? "allow"
   return {
-    id: String(raw?.id ?? randomUUID()),
+    id: String(raw?.id ?? generateId()),
     name: String(raw?.name ?? ""),
     description: toStringValue(raw?.description),
     scope: normaliseScope(raw?.scope),
@@ -189,7 +200,7 @@ function normaliseRewriteActions(raw: any): RewriteActions {
 
 function normaliseRewriteRule(raw: any): RewriteRule {
   return {
-    id: String(raw?.id ?? randomUUID()),
+    id: String(raw?.id ?? generateId()),
     name: String(raw?.name ?? ""),
     description: toStringValue(raw?.description),
     scope: normaliseScope(raw?.scope),
@@ -271,23 +282,32 @@ function normaliseSnapshot(raw: any): ConfigSnapshot {
 }
 
 export async function fetchSnapshot(token: string): Promise<ConfigSnapshot> {
-  if (!CONTROL_PLANE_URL) {
+  const base = resolveControlPlaneURL()
+  if (!base) {
     throw new Error("control plane URL is not configured")
   }
   if (!token) {
     throw new Error("access token missing")
   }
-  const baseUrl = CONTROL_PLANE_URL.replace(/\/$/, "")
+  const baseUrl = base.replace(/\/$/, "")
+  const snapshotUrl = new URL(`${baseUrl}/v1/config/snapshot`)
+  snapshotUrl.searchParams.set("since", "-1")
+  snapshotUrl.searchParams.set("_ts", Date.now().toString())
+
   try {
-    const res = await fetch(`${baseUrl}/v1/config/snapshot`, {
+    const res = await fetch(snapshotUrl.toString(), {
       cache: "no-store",
       headers: {
         Accept: "application/json",
         Authorization: `Bearer ${token}`,
+        "Cache-Control": "no-cache",
+        Pragma: "no-cache",
       },
     })
     if (!res.ok) {
-      throw new Error(`unexpected status ${res.status}`)
+      const error = new Error(`unexpected status ${res.status}`) as Error & { status?: number }
+      error.status = res.status
+      throw error
     }
     const data = await res.json()
     return normaliseSnapshot(data)

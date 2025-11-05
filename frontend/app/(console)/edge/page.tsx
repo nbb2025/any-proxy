@@ -1,61 +1,85 @@
+'use client'
+
+import { useMemo } from "react"
 import Link from "next/link"
-import { redirect } from "next/navigation"
+import { useSnapshot } from "@/hooks/use-snapshot"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Search } from "lucide-react"
 import { EdgeNodesTable, EdgeNodeSummary } from "@/components/edge/nodes-table"
 import { EdgeNodesTabs } from "@/components/edge/nodes-tabs"
-import { fetchSnapshot } from "@/lib/api"
-import { requireAccessToken } from "@/lib/auth.server"
 
-export default async function EdgeNodesPage() {
-  const token = requireAccessToken()
-  let snapshot
-  try {
-    snapshot = await fetchSnapshot(token)
-  } catch (error) {
-    console.error("[edge] fetch snapshot failed", error)
-    redirect("/login")
-  }
+export default function EdgeNodesPage() {
+  const { snapshot, loading, error, reload } = useSnapshot()
 
-  const nodeMap = new Map<string, EdgeNodeSummary>()
+  const { nodes, summary } = useMemo(() => {
+    if (!snapshot) {
+      return { nodes: [] as EdgeNodeSummary[], summary: { total: 0, withDomains: 0, withTunnels: 0, both: 0 } }
+    }
 
-  snapshot.domains.forEach((domain) => {
-    const nodes = domain.edgeNodes.length > 0 ? domain.edgeNodes : ["*"]
-    nodes.forEach((nodeId) => {
-      const key = nodeId === "*" ? "全局" : nodeId
-      if (!nodeMap.has(key)) {
-        nodeMap.set(key, { id: key, domains: [], tunnels: [] })
-      }
-      const entry = nodeMap.get(key)!
-      entry.domains.push({ id: domain.id, domain: domain.domain, enableTls: domain.enableTls })
-    })
-  })
+    const nodeMap = new Map<string, EdgeNodeSummary>()
 
-  snapshot.tunnels.forEach((tunnel) => {
-    const nodes = tunnel.nodeIds.length > 0 ? tunnel.nodeIds : ["*"]
-    nodes.forEach((nodeId) => {
-      const key = nodeId === "*" ? "全局" : nodeId
-      if (!nodeMap.has(key)) {
-        nodeMap.set(key, { id: key, domains: [], tunnels: [] })
-      }
-      const entry = nodeMap.get(key)!
-      entry.tunnels.push({
-        id: tunnel.id,
-        protocol: tunnel.protocol,
-        bindHost: tunnel.bindHost,
-        bindPort: tunnel.bindPort,
+    snapshot.domains.forEach((domain) => {
+      const nodes = domain.edgeNodes.length > 0 ? domain.edgeNodes : ["*"]
+      nodes.forEach((nodeId) => {
+        const key = nodeId === "*" ? "全局" : nodeId
+        if (!nodeMap.has(key)) {
+          nodeMap.set(key, { id: key, domains: [], tunnels: [] })
+        }
+        const entry = nodeMap.get(key)!
+        entry.domains.push({ id: domain.id, domain: domain.domain, enableTls: domain.enableTls })
       })
     })
-  })
 
-  const nodes = Array.from(nodeMap.values()).sort((a, b) => a.id.localeCompare(b.id))
+    snapshot.tunnels.forEach((tunnel) => {
+      const nodes = tunnel.nodeIds.length > 0 ? tunnel.nodeIds : ["*"]
+      nodes.forEach((nodeId) => {
+        const key = nodeId === "*" ? "全局" : nodeId
+        if (!nodeMap.has(key)) {
+          nodeMap.set(key, { id: key, domains: [], tunnels: [] })
+        }
+        const entry = nodeMap.get(key)!
+        entry.tunnels.push({
+          id: tunnel.id,
+          protocol: tunnel.protocol,
+          bindHost: tunnel.bindHost,
+          bindPort: tunnel.bindPort,
+        })
+      })
+    })
 
-  const summary = {
-    total: nodes.length,
-    withDomains: nodes.filter((node) => node.domains.length > 0 && node.tunnels.length === 0).length,
-    withTunnels: nodes.filter((node) => node.tunnels.length > 0 && node.domains.length === 0).length,
-    both: nodes.filter((node) => node.domains.length > 0 && node.tunnels.length > 0).length,
+    const nodes = Array.from(nodeMap.values()).sort((a, b) => a.id.localeCompare(b.id))
+    const summary = {
+      total: nodes.length,
+      withDomains: nodes.filter((node) => node.domains.length > 0 && node.tunnels.length === 0).length,
+      withTunnels: nodes.filter((node) => node.tunnels.length > 0 && node.domains.length === 0).length,
+      both: nodes.filter((node) => node.domains.length > 0 && node.tunnels.length > 0).length,
+    }
+
+    return { nodes, summary }
+  }, [snapshot])
+
+  if (loading) {
+    return (
+      <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
+        正在加载节点数据...
+      </div>
+    )
+  }
+
+  if (error) {
+    return (
+      <div className="flex h-full flex-col items-center justify-center gap-3 text-sm text-muted-foreground">
+        <p>加载节点数据失败：{error}</p>
+        <Button variant="outline" onClick={reload}>
+          重试
+        </Button>
+      </div>
+    )
+  }
+
+  if (!snapshot) {
+    return null
   }
 
   return (
