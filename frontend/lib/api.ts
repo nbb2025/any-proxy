@@ -17,7 +17,12 @@ import type {
   URLRewrite,
 } from "./types"
 
-const CONTROL_PLANE_URL = process.env.NEXT_PUBLIC_CONTROL_PLANE_URL ?? process.env.CONTROL_PLANE_URL ?? ""
+const CONTROL_PLANE_URL =
+  (typeof window === "undefined"
+    ? process.env.CONTROL_PLANE_INTERNAL_URL ?? process.env.CONTROL_PLANE_URL
+    : process.env.NEXT_PUBLIC_CONTROL_PLANE_URL) ??
+  process.env.NEXT_PUBLIC_CONTROL_PLANE_URL ??
+  ""
 
 function toNumber(value: unknown | undefined): number | undefined {
   if (value === null || value === undefined) return undefined
