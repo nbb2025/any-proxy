@@ -5,6 +5,7 @@ import { promisify } from "node:util"
 import path from "node:path"
 import { existsSync } from "node:fs"
 import { ACCESS_COOKIE_NAME } from "@/lib/auth.server"
+import { getControlPlaneExternalURL, getControlPlaneInternalURL } from "@/lib/control-plane.server"
 
 const execFileAsync = promisify(execFile)
 
@@ -74,11 +75,13 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "unauthorized" }, { status: 401 })
   }
 
+  const externalURL = getControlPlaneExternalURL()
+  const internalURL = getControlPlaneInternalURL()
+
   const controlPlaneUrl =
     payload.controlPlaneUrl?.trim() ??
     process.env.INSTALL_CONTROL_PLANE_URL ??
-    process.env.NEXT_PUBLIC_CONTROL_PLANE_URL ??
-    process.env.CONTROL_PLANE_URL ??
+    externalURL ??
     ""
 
   const args = ["--type", nodeType, "--node", nodeId, "--format", "env", "--ttl-min", String(ttlMinutes)]
@@ -111,6 +114,7 @@ export async function POST(request: Request) {
   }
   if (controlPlaneUrl) {
     execEnv.CONTROL_PLANE_URL = controlPlaneUrl
+    execEnv.CONTROL_PLANE_INTERNAL_URL = internalURL || controlPlaneUrl
   }
   if (agentToken) {
     execEnv.ANYPROXY_AGENT_TOKEN = agentToken

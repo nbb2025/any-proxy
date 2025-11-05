@@ -1,12 +1,13 @@
 import { NextResponse } from "next/server"
 import { cookies } from "next/headers"
 import { ACCESS_COOKIE_NAME, REFRESH_COOKIE_NAME } from "@/lib/auth.server"
-
-const CONTROL_PLANE_URL =
-  process.env.CONTROL_PLANE_URL ?? process.env.NEXT_PUBLIC_CONTROL_PLANE_URL ?? ""
+import { getControlPlaneExternalURL, getControlPlaneInternalURL } from "@/lib/control-plane.server"
 
 export async function POST() {
-  if (!CONTROL_PLANE_URL) {
+  const externalURL = getControlPlaneExternalURL()
+  const internalURL = getControlPlaneInternalURL()
+
+  if (!externalURL && !internalURL) {
     return NextResponse.json({ error: "control plane URL not configured" }, { status: 500 })
   }
 
@@ -15,7 +16,7 @@ export async function POST() {
     return NextResponse.json({ error: "refresh token missing" }, { status: 401 })
   }
 
-  const endpoint = `${CONTROL_PLANE_URL.replace(/\/$/, "")}/auth/refresh`
+  const endpoint = `${(internalURL || externalURL).replace(/\/$/, "")}/auth/refresh`
   const res = await fetch(endpoint, {
     method: "POST",
     headers: { "Content-Type": "application/json" },

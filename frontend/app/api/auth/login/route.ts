@@ -1,11 +1,12 @@
 import { NextResponse } from "next/server"
 import { ACCESS_COOKIE_NAME, REFRESH_COOKIE_NAME } from "@/lib/auth.server"
-
-const CONTROL_PLANE_URL =
-  process.env.CONTROL_PLANE_URL ?? process.env.NEXT_PUBLIC_CONTROL_PLANE_URL ?? ""
+import { getControlPlaneExternalURL, getControlPlaneInternalURL } from "@/lib/control-plane.server"
 
 export async function POST(request: Request) {
-  if (!CONTROL_PLANE_URL) {
+  const externalURL = getControlPlaneExternalURL()
+  const internalURL = getControlPlaneInternalURL()
+
+  if (!externalURL && !internalURL) {
     return NextResponse.json({ error: "control plane URL not configured" }, { status: 500 })
   }
 
@@ -22,7 +23,7 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "username and password required" }, { status: 400 })
   }
 
-  const endpoint = `${CONTROL_PLANE_URL.replace(/\/$/, "")}/auth/login`
+  const endpoint = `${(internalURL || externalURL).replace(/\/$/, "")}/auth/login`
   const res = await fetch(endpoint, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
