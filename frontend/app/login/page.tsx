@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation"
 import { Loader2, Lock, Globe2 } from "lucide-react"
 import { Input } from "@/components/ui/input"
 import { Button } from "@/components/ui/button"
+import { saveAuthTokens, clearAuthTokens } from "@/lib/auth.client"
 
 export default function LoginPage() {
   const router = useRouter()
@@ -29,6 +30,15 @@ export default function LoginPage() {
         const detail = await res.json().catch(() => ({}))
         throw new Error(detail?.error ?? "登录失败")
       }
+      const result = await res.json()
+      if (typeof result?.accessToken !== "string" || typeof result?.refreshToken !== "string") {
+        throw new Error("身份信息缺失")
+      }
+      saveAuthTokens({
+        accessToken: result.accessToken,
+        refreshToken: result.refreshToken,
+        expiresAt: typeof result.expiresAt === "string" ? result.expiresAt : null,
+      })
       router.replace("/")
       router.refresh()
       if (typeof window !== "undefined") {
@@ -39,6 +49,7 @@ export default function LoginPage() {
         setLoading(false)
       }
     } catch (err) {
+      clearAuthTokens()
       setError(err instanceof Error ? err.message : "登录失败")
       setLoading(false)
     }

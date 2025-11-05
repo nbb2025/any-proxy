@@ -41,7 +41,11 @@ export async function POST(request: Request) {
   const forwardedProto = request.headers.get("x-forwarded-proto")
   const proto = forwardedProto?.split(",")[0]?.trim() || requestUrl.protocol.replace(":", "")
   const isSecureRequest = proto.toLowerCase() === "https"
-  const response = NextResponse.json({ ok: true })
+  const response = NextResponse.json({
+    accessToken: data.accessToken,
+    refreshToken: data.refreshToken,
+    expiresAt: data.expiresAt ?? null,
+  })
 
   const accessMaxAge = computeTTLSeconds(data?.expiresAt, 24 * 3600)
   response.cookies.set(ACCESS_COOKIE_NAME, data.accessToken, {
