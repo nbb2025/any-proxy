@@ -5,6 +5,8 @@ import { Analytics } from "@vercel/analytics/next"
 import "./globals.css"
 const _geist = Geist({ subsets: ["latin"] })
 const _geistMono = Geist_Mono({ subsets: ["latin"] })
+const enableVercelAnalytics =
+  process.env.NEXT_PUBLIC_ENABLE_VERCEL_ANALYTICS === "true" || process.env.VERCEL === "1"
 
 export const metadata: Metadata = {
   title: "CDN 管理系统",
@@ -21,7 +23,7 @@ export default function RootLayout({
     <html lang="zh-CN" className="dark">
       <body className={`font-sans antialiased`}>
         {children}
-        <Analytics />
+        {enableVercelAnalytics ? <Analytics /> : null}
       </body>
     </html>
   )
