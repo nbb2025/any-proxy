@@ -70,7 +70,13 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "generate-node-command.sh not found" }, { status: 500 })
   }
 
-  const accessToken = cookies().get?.(ACCESS_COOKIE_NAME)?.value
+  const cookieStore = cookies()
+  const authHeader = request.headers.get("authorization") ?? ""
+  let bearerToken: string | undefined
+  if (authHeader.toLowerCase().startsWith("bearer ")) {
+    bearerToken = authHeader.slice(7).trim()
+  }
+  const accessToken = bearerToken || cookieStore.get?.(ACCESS_COOKIE_NAME)?.value
   if (!accessToken) {
     return NextResponse.json({ error: "unauthorized" }, { status: 401 })
   }

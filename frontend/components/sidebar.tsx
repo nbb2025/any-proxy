@@ -1,10 +1,9 @@
 "use client"
 
-"use client"
-
 import Link from "next/link"
 import { usePathname, useRouter } from "next/navigation"
 import { cn } from "@/lib/utils"
+import { clearAuthTokens } from "@/lib/auth.client"
 import { LayoutDashboard, Network, Database, Shield, Settings, Globe, LogOut } from "lucide-react"
 
 const navigation = [
@@ -21,10 +20,11 @@ export function Sidebar() {
 
   const handleLogout = async () => {
     try {
-      await fetch("/api/auth/logout", { method: "POST" })
+      await fetch("/api/auth/logout", { method: "POST", credentials: "include" })
     } catch (error) {
       console.error("[sidebar] logout failed", error)
     } finally {
+      clearAuthTokens()
       router.replace("/login")
     }
   }

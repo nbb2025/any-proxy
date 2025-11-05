@@ -8,6 +8,7 @@ import { Input } from "@/components/ui/input"
 import { Textarea } from "@/components/ui/textarea"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
 import { Badge } from "@/components/ui/badge"
+import { ensureAccessToken, clearAuthTokens } from "@/lib/auth.client"
 
 type InstallResponse = {
   command: string
@@ -86,9 +87,20 @@ export default function EdgeInstallPage() {
       setError(null)
 
       try {
+        const accessToken = await ensureAccessToken()
+        if (!accessToken) {
+          setError("登录状态已过期，请重新登录后再生成脚本")
+          setLoading(false)
+          clearAuthTokens()
+          return
+        }
+
         const res = await fetch("/api/install-command", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${accessToken}`,
+          },
           body: JSON.stringify({
             nodeType,
             nodeId: nodeId.trim(),
@@ -98,6 +110,7 @@ export default function EdgeInstallPage() {
             outputPath: outputPath.trim() || undefined,
             agentToken: agentToken.trim() || undefined,
           }),
+          credentials: "include",
         })
 
         if (!res.ok) {
