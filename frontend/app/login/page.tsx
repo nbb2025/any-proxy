@@ -23,12 +23,21 @@ export default function LoginPage() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ username, password }),
+        credentials: "include",
       })
       if (!res.ok) {
         const detail = await res.json().catch(() => ({}))
         throw new Error(detail?.error ?? "登录失败")
       }
       router.replace("/")
+      router.refresh()
+      if (typeof window !== "undefined") {
+        window.setTimeout(() => {
+          window.location.replace("/")
+        }, 100)
+      } else {
+        setLoading(false)
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : "登录失败")
       setLoading(false)
@@ -137,4 +146,3 @@ export default function LoginPage() {
     </div>
   )
 }
-
