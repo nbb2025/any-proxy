@@ -10,7 +10,7 @@ export async function POST() {
     return NextResponse.json({ error: "control plane URL not configured" }, { status: 500 })
   }
 
-  const refreshToken = cookies().get(REFRESH_COOKIE_NAME)?.value
+  const refreshToken = cookies().get?.(REFRESH_COOKIE_NAME)?.value
   if (!refreshToken) {
     return NextResponse.json({ error: "refresh token missing" }, { status: 401 })
   }
@@ -25,8 +25,8 @@ export async function POST() {
 
   if (!res.ok) {
     const response = NextResponse.json({ error: "refresh failed" }, { status: 401 })
-    response.cookies.delete(ACCESS_COOKIE_NAME)
-    response.cookies.delete(REFRESH_COOKIE_NAME)
+    response.cookies.delete?.(ACCESS_COOKIE_NAME)
+    response.cookies.delete?.(REFRESH_COOKIE_NAME)
     return response
   }
 

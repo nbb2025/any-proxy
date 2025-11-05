@@ -69,7 +69,7 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "generate-node-command.sh not found" }, { status: 500 })
   }
 
-  const accessToken = cookies().get(ACCESS_COOKIE_NAME)?.value
+  const accessToken = cookies().get?.(ACCESS_COOKIE_NAME)?.value
   if (!accessToken) {
     return NextResponse.json({ error: "unauthorized" }, { status: 401 })
   }
