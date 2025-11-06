@@ -2,28 +2,336 @@
 
 set -euo pipefail
 
-# Only Linux/amd64 environments are supported.
-if [[ "$(uname -s)" != "Linux" ]] || [[ "$(uname -m)" != "x86_64" ]]; then
-  echo "[anyproxy-install] only Linux amd64 is supported by this script" >&2
-  exit 1
-fi
+log_info() {
+  echo "[anyproxy-install] $*"
+}
 
-require_cmd() {
-  if ! command -v "$1" >/dev/null 2>&1; then
-    echo "[anyproxy-install] missing dependency: $1" >&2
-    exit 1
+log_warn() {
+  echo "[anyproxy-install] WARN: $*" >&2
+}
+
+log_error() {
+  echo "[anyproxy-install] ERROR: $*" >&2
+}
+
+die() {
+  log_error "$1"
+  exit "${2:-1}"
+}
+
+ensure_root() {
+  if [[ $EUID -ne 0 ]]; then
+    die "please run this script as root (e.g. prefix with sudo)"
   fi
 }
 
-for bin in curl tar install systemctl jq; do
-  require_cmd "$bin"
-done
+MIN_KERNEL="5.10.0"
+MIN_GLIBC="2.34"
+MIN_CPU_CORES=1
+MIN_MEMORY_MB=2048
+MIN_DISK_GB=20
+
+PKG_MANAGER=""
+PKG_UPDATE_CMD=""
+PKG_INSTALL_CMD=""
+PKG_CHECK_CMD=""
+SKIP_REQUIREMENTS="${ANYPROXY_IGNORE_REQUIREMENTS:-0}"
+PKG_UPDATE_DONE=""
+
+ensure_root
+
+if [[ "$(uname -s)" != "Linux" ]]; then
+  die "unsupported operating system: $(uname -s)"
+fi
+
+extend_path() {
+  case ":$PATH:" in
+    *:/sbin:* ) ;;
+    *) PATH="$PATH:/sbin:/usr/sbin"; export PATH ;;
+  esac
+}
+
+extend_path
+
+version_ge() {
+  local current=$1
+  local required=$2
+  if [[ "$current" == "$required" ]]; then
+    return 0
+  fi
+  local sorted
+  sorted=$(printf '%s\n%s\n' "$current" "$required" | sort -V | tail -n1)
+  [[ "$sorted" == "$current" ]]
+}
+
+OS_ID=""
+OS_VERSION_ID=""
+OS_NAME=""
+OS_LIKE=""
+ARCH="$(uname -m)"
+
+detect_distribution() {
+  if [[ -r /etc/os-release ]]; then
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    OS_ID=${ID:-}
+    OS_VERSION_ID=${VERSION_ID:-}
+    OS_NAME=${PRETTY_NAME:-$NAME}
+    OS_LIKE=${ID_LIKE:-}
+  fi
+
+  if [[ -z $OS_ID || -z $OS_VERSION_ID ]]; then
+    die "unable to detect Linux distribution via /etc/os-release"
+  fi
+}
+
+require_architecture() {
+  case "$ARCH" in
+    x86_64|amd64) ;;
+    *)
+      die "unsupported CPU architecture '${ARCH}' (supported: x86_64)"
+      ;;
+  esac
+}
+
+enforce_supported_distribution() {
+  local major="${OS_VERSION_ID%%.*}"
+  case "$OS_ID" in
+    debian)
+      if ! version_ge "$OS_VERSION_ID" "12"; then
+        die "Debian $OS_VERSION_ID is not supported; please use Debian 12 or newer"
+      fi
+      ;;
+    ubuntu)
+      if ! version_ge "$OS_VERSION_ID" "22.04"; then
+        die "Ubuntu $OS_VERSION_ID is not supported; please use Ubuntu 22.04 or newer"
+      fi
+      ;;
+    rhel|centos|centos_stream|ol|rocky|almalinux)
+      if [[ "$major" -lt 9 ]]; then
+        die "RHEL/CentOS/AlmaLinux/Rocky $OS_VERSION_ID not supported; please use version 9 or newer"
+      fi
+      ;;
+    fedora)
+      if ! version_ge "$OS_VERSION_ID" "40"; then
+        die "Fedora $OS_VERSION_ID not supported; please use Fedora 40 or newer"
+      fi
+      ;;
+    "fedora-coreos")
+      if ! version_ge "$OS_VERSION_ID" "42"; then
+        die "Fedora CoreOS $OS_VERSION_ID not supported; please use 42 or newer"
+      fi
+      ;;
+    amzn)
+      if ! version_ge "$OS_VERSION_ID" "2023"; then
+        die "Amazon Linux $OS_VERSION_ID not supported; please use Amazon Linux 2023 or newer"
+      fi
+      ;;
+    sles|suse|opensuse-leap|opensuse-tumbleweed)
+      if ! version_ge "$OS_VERSION_ID" "15.6"; then
+        die "SUSE/OpenSUSE $OS_VERSION_ID not supported; please use 15.6 or newer"
+      fi
+      ;;
+    *)
+      die "unsupported Linux distribution '$OS_ID'"
+      ;;
+  esac
+}
+
+setup_package_manager() {
+  if command -v apt-get >/dev/null 2>&1; then
+    PKG_MANAGER="apt"
+    PKG_UPDATE_CMD="apt-get update -y"
+    PKG_INSTALL_CMD="DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends"
+    PKG_CHECK_CMD="dpkg -s"
+  elif command -v dnf >/dev/null 2>&1; then
+    PKG_MANAGER="dnf"
+    PKG_UPDATE_CMD="dnf makecache -y"
+    PKG_INSTALL_CMD="dnf install -y"
+    PKG_CHECK_CMD="dnf list installed"
+  elif command -v yum >/dev/null 2>&1; then
+    PKG_MANAGER="yum"
+    PKG_UPDATE_CMD="yum makecache -y"
+    PKG_INSTALL_CMD="yum install -y"
+    PKG_CHECK_CMD="yum list installed"
+  elif command -v zypper >/dev/null 2>&1; then
+    PKG_MANAGER="zypper"
+    PKG_UPDATE_CMD="zypper -n ref"
+    PKG_INSTALL_CMD="zypper -n install --allow-unsigned-rpm"
+    PKG_CHECK_CMD="zypper se -i"
+  else
+    die "unable to determine package manager for distribution '$OS_ID'"
+  fi
+}
+
+pkg_update_once() {
+  if [[ -n "${PKG_UPDATE_DONE:-}" ]]; then
+    return
+  fi
+  log_info "refreshing package metadata via ${PKG_MANAGER}"
+  eval "$PKG_UPDATE_CMD" >/dev/null 2>&1 || log_warn "package metadata refresh failed; continuing anyway"
+  PKG_UPDATE_DONE=1
+}
+
+pkg_installed() {
+  local pkg=$1
+  case "$PKG_MANAGER" in
+    apt)
+      dpkg -s "$pkg" >/dev/null 2>&1
+      ;;
+    dnf|yum)
+      eval "$PKG_CHECK_CMD $pkg" >/dev/null 2>&1
+      ;;
+    zypper)
+      zypper se -i "$pkg" >/dev/null 2>&1
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+pkg_install() {
+  local pkg=$1
+  if pkg_installed "$pkg"; then
+    return
+  fi
+  pkg_update_once
+  log_info "installing missing dependency package '${pkg}'"
+  if ! eval "$PKG_INSTALL_CMD $pkg" >/dev/null 2>&1; then
+    die "failed to install required package '${pkg}'"
+  fi
+}
+
+ensure_command_or_install() {
+  local command_name=$1
+  local deb_pkg=$2
+  local rpm_pkg=${3:-$2}
+  if command -v "$command_name" >/dev/null 2>&1; then
+    return
+  fi
+  case "$PKG_MANAGER" in
+    apt)
+      [[ -n "$deb_pkg" ]] && pkg_install "$deb_pkg"
+      ;;
+    dnf|yum|zypper)
+      [[ -n "$rpm_pkg" ]] && pkg_install "$rpm_pkg"
+      ;;
+  esac
+  if ! command -v "$command_name" >/dev/null 2>&1; then
+    die "missing required command '${command_name}' even after attempting installation"
+  fi
+}
+
+ensure_base_dependencies() {
+  ensure_command_or_install "curl" "curl"
+  ensure_command_or_install "tar" "tar"
+  ensure_command_or_install "gzip" "gzip"
+  ensure_command_or_install "gpg" "gnupg" "gnupg2"
+  ensure_command_or_install "lsb_release" "lsb-release" "redhat-lsb-core"
+  ensure_command_or_install "install" "coreutils"
+  pkg_install "ca-certificates"
+  if ! command -v systemctl >/dev/null 2>&1; then
+    die "systemctl is required but not available; ensure systemd is installed and active"
+  fi
+}
+
+check_kernel_version() {
+  local kernel
+  kernel=$(uname -r | cut -d- -f1)
+  if ! version_ge "$kernel" "$MIN_KERNEL"; then
+    die "kernel version ${kernel} detected; requires ${MIN_KERNEL} or newer"
+  fi
+}
+
+check_glibc_version() {
+  if ! command -v ldd >/dev/null 2>&1; then
+    die "'ldd' command not found; glibc tooling missing"
+  fi
+  local glibc_version
+  glibc_version=$(ldd --version | head -n1 | awk '{print $NF}')
+  if [[ -z "$glibc_version" ]]; then
+    die "unable to determine glibc version"
+  fi
+  if ! version_ge "$glibc_version" "$MIN_GLIBC"; then
+    die "glibc ${glibc_version} detected; requires ${MIN_GLIBC} or newer"
+  fi
+}
+
+check_resource_baseline() {
+  local cpu_count mem_kb mem_mb disk_kb disk_gb
+  if command -v nproc >/dev/null 2>&1; then
+    cpu_count=$(nproc)
+  else
+    cpu_count=$(grep -c '^processor' /proc/cpuinfo || echo 1)
+  fi
+  if (( cpu_count < MIN_CPU_CORES )); then
+    die "system has ${cpu_count} CPU core(s); requires at least ${MIN_CPU_CORES}"
+  fi
+
+  mem_kb=$(grep -i '^MemTotal:' /proc/meminfo | awk '{print $2}')
+  mem_mb=$(( mem_kb / 1024 ))
+  if (( mem_mb < MIN_MEMORY_MB )); then
+    die "system memory ${mem_mb}MB is below required ${MIN_MEMORY_MB}MB"
+  fi
+
+  disk_kb=$(df -Pk --output=avail / 2>/dev/null | tail -n1 | tr -d ' ')
+  if [[ -z "$disk_kb" ]]; then
+    disk_kb=$(df -Pk / | awk 'NR==2 {print $4}')
+  fi
+  if [[ -z "$disk_kb" ]]; then
+    die "unable to determine available disk space on root filesystem"
+  fi
+  disk_gb=$(( disk_kb / 1024 / 1024 ))
+  if (( disk_gb < MIN_DISK_GB )); then
+    die "root filesystem free space ${disk_gb}GB is below required ${MIN_DISK_GB}GB"
+  fi
+}
+
+detect_distribution
+setup_package_manager
+ensure_base_dependencies
+
+log_info "detected distribution: ${OS_NAME} (${OS_ID} ${OS_VERSION_ID})"
+log_info "using package manager: ${PKG_MANAGER}"
+
+if [[ "$SKIP_REQUIREMENTS" == "1" ]]; then
+  log_warn "ANYPROXY_IGNORE_REQUIREMENTS=1 set; skipping OS/kernel/resource checks"
+else
+  require_architecture
+  enforce_supported_distribution
+  check_kernel_version
+  check_glibc_version
+  check_resource_baseline
+fi
 
 ensure_systemctl_service() {
   local service=$1
   if command -v systemctl >/dev/null 2>&1; then
     systemctl enable --now "$service" >/dev/null 2>&1 || true
   fi
+}
+
+resolve_openresty_repo_release() {
+  local distro=$1
+  local release=$2
+  local lowered
+  lowered=$(echo "${release}" | tr '[:upper:]' '[:lower:]')
+  case "$distro" in
+    debian)
+      case "$lowered" in
+        bookworm|bullseye|buster) echo "$lowered"; return ;;
+        trixie|testing|sid) echo "bookworm"; return ;;
+      esac
+      ;;
+    ubuntu)
+      case "$lowered" in
+        jammy|focal|bionic) echo "$lowered"; return ;;
+        noble|mantic|lunar|kinetic|impish|hirsute|groovy|eoan) echo "jammy"; return ;;
+      esac
+      ;;
+  esac
+  echo ""
 }
 
 install_openresty() {
@@ -33,6 +341,11 @@ install_openresty() {
   fi
 
   if command -v apt-get >/dev/null 2>&1; then
+    local openresty_list="/etc/apt/sources.list.d/openresty.list"
+    if [[ -f "$openresty_list" ]]; then
+      echo "[anyproxy-install] removing stale OpenResty apt source ${openresty_list}"
+      rm -f "$openresty_list"
+    fi
     apt-get update -y
     apt-get install -y curl gnupg ca-certificates lsb-release
     local release
@@ -43,11 +356,26 @@ install_openresty() {
       ubuntu|debian) ;;
       *) distro="ubuntu" ;;
     esac
+    local normalized_release
+    normalized_release=$(echo "${release}" | tr '[:upper:]' '[:lower:]')
+    local repo_release
+    repo_release=$(resolve_openresty_repo_release "$distro" "$normalized_release")
+    if [[ -z "$repo_release" ]]; then
+      echo "[anyproxy-install] unsupported ${distro} release '${release}' for OpenResty repository" >&2
+      echo "[anyproxy-install] please install openresty manually and re-run this script" >&2
+      exit 1
+    fi
+    if [[ "$repo_release" != "$normalized_release" ]]; then
+      echo "[anyproxy-install] falling back to OpenResty '${repo_release}' packages for ${distro} '${release}'" >&2
+    fi
     local keyring="/usr/share/keyrings/openresty-archive-keyring.gpg"
     mkdir -p /usr/share/keyrings
-    curl -fsSL https://openresty.org/package/pubkey.gpg | gpg --dearmor -o "$keyring"
+    if [[ -f "$keyring" ]]; then
+      rm -f "$keyring"
+    fi
+    curl -fsSL https://openresty.org/package/pubkey.gpg | gpg --dearmor --batch --yes -o "$keyring"
     cat <<EOF >/etc/apt/sources.list.d/openresty.list
-deb [signed-by=${keyring}] https://openresty.org/package/${distro} ${release} main
+deb [signed-by=${keyring}] https://openresty.org/package/${distro} ${repo_release} openresty
 EOF
     apt-get update -y
     apt-get install -y openresty
@@ -102,7 +430,6 @@ install_haproxy_pkg() {
 CONTROL_PLANE_URL="${ANYPROXY_CONTROL_PLANE:-}"
 NODE_TYPE="${ANYPROXY_NODE_TYPE:-}"
 NODE_ID="${ANYPROXY_NODE_ID:-}"
-TOKEN="${ANYPROXY_TOKEN:-}"
 VERSION="${ANYPROXY_VERSION:-latest}"
 RELOAD_CMD="${ANYPROXY_RELOAD_CMD:-nginx -s reload}"
 OUTPUT_PATH="${ANYPROXY_OUTPUT_PATH:-}"
@@ -116,13 +443,12 @@ NODE_GROUP_ID="${ANYPROXY_NODE_GROUP_ID:-}"
 
 usage() {
   cat <<'EOF'
-Usage: agent.sh --control-plane URL --type edge|tunnel --node NODE_ID --token TOKEN [--version VERSION] [--reload CMD] [--output PATH] [--stream-output PATH] [--node-name NAME] [--node-category KIND] [--group-id ID] [--cert-dir PATH] [--client-ca-dir PATH] [--agent-token TOKEN]
+Usage: edge-install.sh --control-plane URL --type edge|tunnel [--node NODE_ID] [--version VERSION] [--reload CMD] [--output PATH] [--stream-output PATH] [--node-name NAME] [--node-category KIND] [--group-id ID] [--cert-dir PATH] [--client-ca-dir PATH] [--agent-token TOKEN]
 
 Environment overrides:
   ANYPROXY_CONTROL_PLANE default control plane URL
   ANYPROXY_NODE_TYPE     default node type (edge/tunnel)
   ANYPROXY_NODE_ID       default node ID
-  ANYPROXY_TOKEN         default token string
   ANYPROXY_VERSION       default version to install (fallback: latest)
   ANYPROXY_RELOAD_CMD    reload command for nginx/openresty (fallback: "nginx -s reload")
   ANYPROXY_OUTPUT_PATH   default HTTP config output path
@@ -133,6 +459,7 @@ Environment overrides:
   ANYPROXY_NODE_NAME     default node display name passed to agent
   ANYPROXY_NODE_CATEGORY default node category hint (cdn/tunnel)
   ANYPROXY_NODE_GROUP_ID default node group identifier
+  ANYPROXY_IGNORE_REQUIREMENTS set to 1 to skip OS/CPU/memory/disk checks (NOT recommended)
 EOF
   exit 1
 }
@@ -149,10 +476,6 @@ while [[ $# -gt 0 ]]; do
       ;;
     --node)
       NODE_ID=${2:-}
-      shift 2
-      ;;
-    --token)
-      TOKEN=${2:-}
       shift 2
       ;;
     --version)
@@ -205,9 +528,34 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ -z $CONTROL_PLANE_URL || -z $NODE_TYPE || -z $NODE_ID || -z $TOKEN ]]; then
+generate_node_id() {
+  if command -v uuidgen >/dev/null 2>&1; then
+    printf "node-%s\n" "$(uuidgen | tr 'A-Z' 'a-z')"
+    return
+  fi
+  if [[ -r /proc/sys/kernel/random/uuid ]]; then
+    printf "node-%s\n" "$(tr 'A-Z' 'a-z' </proc/sys/kernel/random/uuid)"
+    return
+  fi
+  local ts random_hex
+  ts=$(date +%s)
+  if command -v od >/dev/null 2>&1; then
+    random_hex=$(od -An -N4 -tx4 /dev/urandom 2>/dev/null | tr -d ' ')
+  fi
+  random_hex=${random_hex:-$RANDOM}
+  printf "node-%s-%s\n" "$ts" "$random_hex"
+}
+
+NODE_ID="$(echo "${NODE_ID}" | tr -d '[:space:]')"
+
+if [[ -z $CONTROL_PLANE_URL || -z $NODE_TYPE ]]; then
   echo "[anyproxy-install] missing required arguments" >&2
   usage
+fi
+
+if [[ -z $NODE_ID ]]; then
+  NODE_ID=$(generate_node_id)
+  echo "[anyproxy-install] generated node id: ${NODE_ID}"
 fi
 
 if [[ "$NODE_TYPE" != "edge" && "$NODE_TYPE" != "tunnel" ]]; then
@@ -226,39 +574,6 @@ esac
 
 CONTROL_PLANE_URL=${CONTROL_PLANE_URL%/}
 
-TOKEN_URL="${CONTROL_PLANE_URL}/install/tokens/${TOKEN}.json"
-echo "[anyproxy-install] validating token against ${TOKEN_URL}"
-
-TOKEN_FILE=$(mktemp)
-cleanup() {
-  rm -f "$TOKEN_FILE"
-}
-trap cleanup EXIT
-
-if ! curl -fsSL "$TOKEN_URL" -o "$TOKEN_FILE"; then
-  echo "[anyproxy-install] failed to fetch token metadata" >&2
-  exit 1
-fi
-
-EXPIRES_AT=$(jq -r '.expiresAt // empty' "$TOKEN_FILE")
-TOKEN_TYPE=$(jq -r '.type // empty' "$TOKEN_FILE")
-TOKEN_NODE=$(jq -r '.node // empty' "$TOKEN_FILE")
-
-if [[ -z $EXPIRES_AT || -z $TOKEN_TYPE || -z $TOKEN_NODE ]]; then
-  echo "[anyproxy-install] token metadata missing fields" >&2
-  exit 1
-fi
-
-CURRENT_TS=$(date -u +%s)
-if (( CURRENT_TS > EXPIRES_AT )); then
-  echo "[anyproxy-install] token has expired" >&2
-  exit 1
-fi
-if [[ "$TOKEN_TYPE" != "$NODE_TYPE" || "$TOKEN_NODE" != "$NODE_ID" ]]; then
-  echo "[anyproxy-install] token does not match requested node/type" >&2
-  exit 1
-fi
-
 if [[ "$NODE_TYPE" == "edge" ]]; then
   install_openresty
   install_haproxy_pkg
@@ -267,7 +582,10 @@ else
 fi
 
 TMPDIR=$(mktemp -d)
-trap 'cleanup; rm -rf "$TMPDIR"' EXIT
+cleanup() {
+  rm -rf "$TMPDIR"
+}
+trap cleanup EXIT
 
 download_agent() {
   local agent_type=$1
@@ -372,15 +690,6 @@ if [[ "$NODE_TYPE" == "edge" ]]; then
     "-node-id" "${NODE_ID}"
     "-output" "${TUNNEL_OUTPUT_PATH}"
   )
-  if [[ -n $NODE_NAME ]]; then
-    TUNNEL_EXEC_ARGS+=("-node-name" "${NODE_NAME}")
-  fi
-  if [[ -n $NODE_CATEGORY ]]; then
-    TUNNEL_EXEC_ARGS+=("-node-category" "${NODE_CATEGORY}")
-  fi
-  if [[ -n $NODE_GROUP_ID ]]; then
-    TUNNEL_EXEC_ARGS+=("-group-id" "${NODE_GROUP_ID}")
-  fi
   if [[ -n $NODE_NAME ]]; then
     TUNNEL_EXEC_ARGS+=("-node-name" "${NODE_NAME}")
   fi

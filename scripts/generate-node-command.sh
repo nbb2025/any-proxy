@@ -4,7 +4,7 @@ set -euo pipefail
 
 require_cmd() {
   if ! command -v "$1" >/dev/null 2>&1; then
-    echo "[anyproxy-token] missing dependency: $1" >&2
+    echo "[anyproxy-command] missing dependency: $1" >&2
     exit 1
   fi
 }
@@ -13,33 +13,12 @@ escape() {
   printf %q "$1"
 }
 
-if command -v openssl >/dev/null 2>&1; then
-  generate_token() {
-    openssl rand -hex 16
-  }
-else
-  require_cmd hexdump
-  generate_token() {
-    hexdump -vn16 -e '16/1 "%02x"' /dev/urandom
-  }
-fi
-
-generate_node_id() {
-  if command -v uuidgen >/dev/null 2>&1; then
-    printf "node-%s" "$(uuidgen | tr 'A-Z' 'a-z')"
-  else
-    printf "node-%s-%s" "$(date +%s)" "$RANDOM"
-  fi
-}
-
-CONTROL_PLANE_URL="${CONTROL_PLANE_URL:-https://anyproxy.weekeasy.com}"
+CONTROL_PLANE_URL="${CONTROL_PLANE_URL:-}"
 NODE_TYPE=""
 NODE_ID=""
 NODE_NAME="${ANYPROXY_NODE_NAME:-}"
 NODE_GROUP="${ANYPROXY_NODE_GROUP_ID:-}"
 NODE_CATEGORY="${ANYPROXY_NODE_CATEGORY:-}"
-TTL_MINUTES=30
-TOKENS_DIR="${ANYPROXY_TOKENS_DIR:-/opt/anyproxy/install/tokens}"
 VERSION="${ANYPROXY_VERSION:-latest}"
 RELOAD_CMD="${ANYPROXY_RELOAD_CMD:-}"
 OUTPUT_PATH="${ANYPROXY_OUTPUT_PATH:-}"
@@ -54,9 +33,7 @@ usage() {
 Usage: generate-node-command.sh --type edge|tunnel [--node NODE_ID] [options]
 
 Options:
-  --control-plane URL   Base URL where agent.sh/token is hosted (default: env CONTROL_PLANE_URL or https://anyproxy.weekeasy.com)
-  --ttl-min MINUTES     Token validity window in minutes (default: 30)
-  --tokens-dir PATH     Directory to store token json files (default: /opt/anyproxy/install/tokens or env ANYPROXY_TOKENS_DIR)
+  --control-plane URL   Base URL where edge-install.sh is hosted (default: env CONTROL_PLANE_URL)
   --version VERSION     Agent version tag (default: env ANYPROXY_VERSION or "latest")
   --reload CMD          Override reload command passed to installer (default: env ANYPROXY_RELOAD_CMD)
   --output PATH         Override agent --output path passed to installer
@@ -71,7 +48,6 @@ Options:
 
 Environment:
   CONTROL_PLANE_URL     Default control plane / install base URL
-  ANYPROXY_TOKENS_DIR   Storage directory for generated token files
   ANYPROXY_VERSION      Default agent version
   ANYPROXY_RELOAD_CMD   Default reload command
   ANYPROXY_OUTPUT_PATH  Default HTTP output path override
@@ -99,14 +75,6 @@ while [[ $# -gt 0 ]]; do
       ;;
     --node)
       NODE_ID=${2:-}
-      shift 2
-      ;;
-    --ttl-min)
-      TTL_MINUTES=${2:-}
-      shift 2
-      ;;
-    --tokens-dir)
-      TOKENS_DIR=${2:-}
       shift 2
       ;;
     --format)
@@ -157,25 +125,20 @@ while [[ $# -gt 0 ]]; do
       usage
       ;;
     *)
-      echo "[anyproxy-token] unknown argument: $1" >&2
+      echo "[anyproxy-command] unknown argument: $1" >&2
       usage
       ;;
   esac
 done
 
 if [[ -z $NODE_TYPE ]]; then
-  echo "[anyproxy-token] --type is required" >&2
+  echo "[anyproxy-command] --type is required" >&2
   usage
 fi
 
 if [[ "$NODE_TYPE" != "edge" && "$NODE_TYPE" != "tunnel" ]]; then
-  echo "[anyproxy-token] --type must be edge or tunnel" >&2
+  echo "[anyproxy-command] --type must be edge or tunnel" >&2
   exit 1
-fi
-
-if [[ -z $NODE_ID ]]; then
-  NODE_ID=$(generate_node_id)
-  echo "[anyproxy-token] auto-generated node id: ${NODE_ID}"
 fi
 
 NODE_CATEGORY=$(echo "${NODE_CATEGORY,,}")
@@ -189,35 +152,21 @@ esac
 case "$OUTPUT_FORMAT" in
   text|env) ;;
   *)
-    echo "[anyproxy-token] unsupported format: ${OUTPUT_FORMAT}" >&2
+    echo "[anyproxy-command] unsupported format: ${OUTPUT_FORMAT}" >&2
     exit 1
     ;;
 esac
 
-require_cmd date
-require_cmd mkdir
-require_cmd cat
-
-TOKEN=$(generate_token)
-NOW_TS=$(date -u +%s)
-TTL_SECONDS=$((TTL_MINUTES * 60))
-EXP_TS=$((NOW_TS + TTL_SECONDS))
-
-mkdir -p "$TOKENS_DIR"
-
-TOKEN_PATH="${TOKENS_DIR%/}/${TOKEN}.json"
-cat >"$TOKEN_PATH" <<EOF
-{"token":"${TOKEN}","type":"${NODE_TYPE}","node":"${NODE_ID}","expiresAt":${EXP_TS},"issuedAt":${NOW_TS}}
-EOF
-
 CONTROL_PLANE_URL=${CONTROL_PLANE_URL%/}
-INSTALL_URL="${CONTROL_PLANE_URL}/install/agent.sh"
+INSTALL_URL="${CONTROL_PLANE_URL}/install/edge-install.sh"
 
 CMD="curl -fsSL ${INSTALL_URL} | sudo"
 CMD+=" ANYPROXY_CONTROL_PLANE=$(escape "${CONTROL_PLANE_URL}")"
 CMD+=" ANYPROXY_NODE_TYPE=$(escape "${NODE_TYPE}")"
-CMD+=" ANYPROXY_NODE_ID=$(escape "${NODE_ID}")"
-CMD+=" ANYPROXY_TOKEN=$(escape "${TOKEN}")"
+
+if [[ -n $NODE_ID ]]; then
+  CMD+=" ANYPROXY_NODE_ID=$(escape "${NODE_ID}")"
+fi
 
 if [[ -n $VERSION ]]; then
   CMD+=" ANYPROXY_VERSION=$(escape "${VERSION}")"
@@ -255,10 +204,6 @@ CMD+=" bash"
 if [[ "$OUTPUT_FORMAT" == "env" ]]; then
   {
     printf 'COMMAND=%s\n' "$CMD"
-    printf 'TOKEN=%s\n' "$TOKEN"
-    printf 'TOKEN_PATH=%s\n' "$TOKEN_PATH"
-    printf 'EXPIRES_AT=%s\n' "$EXP_TS"
-    printf 'EXPIRES_AT_ISO=%s\n' "$(date -u -d "@${EXP_TS}" +%Y-%m-%dT%H:%M:%SZ)"
     printf 'CONTROL_PLANE_URL=%s\n' "$CONTROL_PLANE_URL"
     printf 'NODE_TYPE=%s\n' "$NODE_TYPE"
     printf 'NODE_ID=%s\n' "$NODE_ID"
@@ -272,24 +217,25 @@ if [[ "$OUTPUT_FORMAT" == "env" ]]; then
     printf 'CERT_DIR=%s\n' "$CERT_DIR"
     printf 'CLIENT_CA_DIR=%s\n' "$CLIENT_CA_DIR"
     printf 'AGENT_TOKEN=%s\n' "$AGENT_TOKEN"
-  }
-  exit 0
+}
+exit 0
 fi
 
-echo "[anyproxy-token] token written to ${TOKEN_PATH}"
-echo
 if [[ "$NODE_TYPE" == "edge" ]]; then
   echo "在目标边缘节点执行以下命令（将同步部署 HTTP + 隧道 Agent）："
 else
   echo "在目标 ${NODE_TYPE} 节点执行以下命令："
 fi
 if [[ -n $NODE_NAME ]]; then
-  echo "[anyproxy-token] 节点名称：${NODE_NAME}"
+  echo "[anyproxy-command] 节点名称：${NODE_NAME}"
 fi
 if [[ -n $NODE_CATEGORY ]]; then
-  echo "[anyproxy-token] 节点用途：${NODE_CATEGORY}"
+  echo "[anyproxy-command] 节点用途：${NODE_CATEGORY}"
+fi
+if [[ -z $NODE_ID ]]; then
+  echo "[anyproxy-command] 节点 ID 将在首次安装时自动生成"
+else
+  echo "[anyproxy-command] 指定节点 ID：${NODE_ID}"
 fi
 echo
 echo "$CMD"
-echo
-echo "[anyproxy-token] token 将于 $(date -u -d "@${EXP_TS}") 过期"

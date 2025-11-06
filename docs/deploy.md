@@ -151,12 +151,26 @@ docker compose down
 
 ---
 
+### 7.0 环境与资源要求
+
+在批量部署前请确认节点环境满足以下最低要求（推荐使用更高规格以保障性能）：
+
+| 项目 | 要求 |
+| --- | --- |
+| 操作系统 | Debian 12、Ubuntu 22.04/24.04、RHEL 9、AlmaLinux 9、Rocky Linux 9、CentOS Stream 9、Fedora CoreOS 42、Fedora 40、SLES 15 SP6、openSUSE Leap 15.6、Oracle Linux 9、Amazon Linux 2023 |
+| 内核版本 | `>= 5.10.0` |
+| GLIBC | `>= 2.34` |
+| CPU | `>= 1` vCPU（根据业务建议 2 核以上） |
+| 内存 | `>= 2 GB`（生产建议 4 GB 以上） |
+| 存储 | `>= 20 GB` 可用磁盘空间 |
+| 网络 | 节点需具备入站/出站访问权限；如需限制端口，至少开放入站 80/443，出站 443，其余端口按业务开放 |
+
 ### 7.1 一键安装脚本（Linux amd64）
 
-为方便批量部署，可使用仓库新增的脚本生成一次性命令，在边缘主机直接执行即可完成安装。
+为方便批量部署，可使用仓库提供的脚本输出标准安装命令，在边缘主机直接执行即可完成安装。命令可以重复使用，每次执行都会在目标节点上生成新的节点 ID。
 
-1. **准备静态文件服务**  
-   将仓库中的 `install/agent.sh` 暴露为 `https://anyproxy.weekeasy.com/install/agent.sh`，并把 `scripts/generate-node-command.sh` 生成的 token JSON（默认存放在 `/opt/anyproxy/install/tokens/`）一起通过 Web 服务器提供。例如 Nginx 配置示例：
+1. **准备静态文件服务**
+   将仓库中的 `install/edge-install.sh` 以及 `install/binaries/` 目录暴露为 `https://your-domain.com/install/`。例如 Nginx 配置：
 
    ```nginx
    location /install/ {
@@ -167,45 +181,41 @@ docker compose down
    }
    ```
 
-   建议在控制平面节点上执行 `chmod +x install/agent.sh scripts/generate-node-command.sh` 后再挂载目录。
+   建议在控制平面节点执行 `chmod +x install/edge-install.sh scripts/generate-node-command.sh` 后再挂载目录。
 
 2. **控制平面上生成命令**
 
    ```bash
    scripts/generate-node-command.sh \
      --type edge \
-     --node edge-shanghai-01 \
-     --control-plane https://anyproxy.weekeasy.com \
-     --version v0.1.0 \
-     --ttl-min 60
+     --control-plane https://your-domain.com \
+     --version v0.1.0
    ```
 
-   脚本会输出一次性 token，并生成一段多行安装命令。JSON token 默认写入 `/opt/anyproxy/install/tokens/<token>.json`，有效期可通过 `--ttl-min`（分钟）调整。
-   命令形如：
+   脚本会打印一段多行安装命令，并可选显示节点名称、用途、分组等信息。若需要为某个节点指定固定 ID，可额外传入 `--node <ID>`。
+   生成的命令类似：
 
    ```
-   curl -fsSL https://anyproxy.weekeasy.com/install/agent.sh | sudo \
-     ANYPROXY_CONTROL_PLANE=https://anyproxy.weekeasy.com \
+   curl -fsSL https://your-domain.com/install/edge-install.sh | sudo \
+     ANYPROXY_CONTROL_PLANE=https://your-domain.com \
      ANYPROXY_NODE_TYPE=edge \
-     ANYPROXY_NODE_ID=edge-shanghai-01 \
-     ANYPROXY_TOKEN=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx \
      ANYPROXY_VERSION=v0.1.0 \
      bash
    ```
 
 3. **在目标节点执行命令**
 
-   复制粘贴脚本打印的命令到目标主机（需具备 `sudo` 权限，命令通过环境变量传入 token/节点信息），安装程序会：
-   - 校验 token 是否仍然有效；
-   - 下载 `edge` 或 `tunnel` agent 二进制（路径形如 `/install/binaries/<版本>/<类型>_linux_amd64.tar.gz`，需提前上传）；
-   - 写入 `/usr/local/bin/anyproxy-<type>`；
-   - 生成 Systemd 服务文件（如 `anyproxy-edge-edge-shanghai-01.service`）并立即启动；
-   - 默认把渲染文件写到 `edge`：`/etc/nginx/conf.d/anyproxy-<node>.conf`，`tunnel`：`/etc/nginx/stream.d/anyproxy-<node>.conf`，可通过 `--output` 覆盖。
+   复制脚本输出到目标主机执行（需具备 `sudo` 权限）。安装程序会：
+   - 自动生成唯一节点 ID 并写入 Systemd 服务；
+   - 下载 `edge` 与 `tunnel` agent 二进制（路径形如 `/install/binaries/<版本>/<类型>_linux_amd64.tar.gz`，需提前上传）；
+   - 安装到 `/usr/local/bin/anyproxy-<type>`；
+   - 生成并启动 Systemd 服务（如 `anyproxy-edge-<节点ID>.service`）；
+   - 默认将渲染文件写到 `edge`：`/etc/nginx/conf.d/anyproxy-<节点ID>.conf`，`tunnel`：`/etc/nginx/stream.d/anyproxy-<节点ID>.conf`，可通过 `--output` 覆盖路径。
 
-   如果需要自定义 `nginx` reload 命令，可在控制端生成 token 时附加 `--reload "openresty -s reload"`，脚本会把参数透传到安装命令中。
+   如需自定义 `nginx` reload 命令，可在生成命令时通过 `--reload "openresty -s reload"` 透传。
 
-4. **Token 清理与安全**  
-   token 一次有效，过期后安装脚本会拒绝执行。可结合 `cron` 或 Systemd Timer 定期清理 `/opt/anyproxy/install/tokens/` 中早于当前时间的 JSON 文件，避免目录无限增长。
+4. **安全提示**  
+   由于命令可重复使用，请确保控制平面地址及任意注入的 `ANYPROXY_AGENT_TOKEN` 仅对受信主机可见。如命令泄露，可在控制平面侧旋转访问入口或刷新 Agent 访问令牌。
 
 ---
 

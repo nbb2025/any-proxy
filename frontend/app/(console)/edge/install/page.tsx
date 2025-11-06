@@ -2,11 +2,10 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react"
 import Link from "next/link"
-import { Monitor, Server, RefreshCw, Copy, Check, Terminal, Shield, Timer, AlertCircle } from "lucide-react"
+import { Monitor, Server, RefreshCw, Copy, Check, Terminal, Shield, AlertCircle } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Textarea } from "@/components/ui/textarea"
-import { Badge } from "@/components/ui/badge"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import type { NodeCategory, NodeGroup } from "@/lib/types"
 import { fetchNodeGroups } from "@/lib/api"
@@ -14,24 +13,34 @@ import { ensureAccessToken, clearAuthTokens } from "@/lib/auth.client"
 
 type InstallResponse = {
   command: string
-  token: string
-  expiresAt: number | null
-  expiresAtIso: string | null
   controlPlaneUrl: string
-  nodeId: string
+  nodeType: string
+  nodeId: string | null
   nodeName: string | null
   nodeCategory: string | null
   groupId: string | null
-  ttlMinutes: number
-  version: string | null
-  reloadCmd: string | null
-  outputPath: string | null
-  streamOutputPath: string | null
   agentToken: string | null
+  autoGeneratesNodeId: boolean
 }
 
-const MIN_TTL = 5
-const MAX_TTL = 180
+const SUPPORTED_OS_GROUPS: { title: string; entries: string[] }[] = [
+  { title: "Debian / Ubuntu", entries: ["Debian 12 (bookworm)", "Ubuntu 22.04", "Ubuntu 24.04"] },
+  { title: "Red Hat 系", entries: ["Red Hat Enterprise Linux 9", "AlmaLinux 9", "Rocky Linux 9", "CentOS Stream 9", "Oracle Linux 9"] },
+  { title: "Fedora / CoreOS", entries: ["Fedora CoreOS 42", "Fedora 40"] },
+  { title: "SUSE 家族", entries: ["SLES 15 SP6", "openSUSE Leap 15.6"] },
+  { title: "Amazon Linux", entries: ["Amazon Linux 2023"] },
+]
+
+const RESOURCE_REQUIREMENTS: { label: string; value: string }[] = [
+  { label: "Linux 内核版本", value: ">= 5.10.0" },
+  { label: "GLIBC", value: ">= 2.34" },
+  { label: "CPU 核心数", value: ">= 1" },
+  { label: "内存空间", value: ">= 2 GB" },
+  { label: "存储空间", value: ">= 20 GB" },
+]
+
+const NETWORK_REQUIREMENT =
+  "边缘节点需具备入站/出站网络访问能力。如需限制端口，至少开放入站 80 与 443，出站 443，其余端口按照业务需求配置。"
 
 const CATEGORY_OPTIONS: { value: NodeCategory; label: string; description: string }[] = [
   { value: "cdn", label: "CDN 节点", description: "用于 HTTP/HTTPS/WebSocket 等应用层流量代理。" },
@@ -44,20 +53,6 @@ const CATEGORY_LABELS: Record<string, string> = {
   waiting: "待分组",
 }
 
-function formatRemaining(expiryIso: string | null): string {
-  if (!expiryIso) return "未知"
-  const expiresAt = new Date(expiryIso).getTime()
-  const diff = expiresAt - Date.now()
-  if (Number.isNaN(expiresAt) || diff <= 0) {
-    return "已过期"
-  }
-  const minutes = Math.floor(diff / 60000)
-  const seconds = Math.floor((diff % 60000) / 1000)
-  const mm = minutes.toString().padStart(2, "0")
-  const ss = seconds.toString().padStart(2, "0")
-  return `${mm}分${ss}秒`
-}
-
 export default function EdgeInstallPage() {
   const [nodeName, setNodeName] = useState("")
   const [category, setCategory] = useState<NodeCategory>("cdn")
@@ -65,14 +60,8 @@ export default function EdgeInstallPage() {
   const [groups, setGroups] = useState<NodeGroup[]>([])
   const [groupsLoading, setGroupsLoading] = useState(true)
   const [groupsError, setGroupsError] = useState<string | null>(null)
-  const [ttlMinutes, setTtlMinutes] = useState(30)
-  const [version, setVersion] = useState("")
-  const [reloadCmd, setReloadCmd] = useState("")
-  const [outputPath, setOutputPath] = useState("")
-  const [streamOutputPath, setStreamOutputPath] = useState("")
   const [agentToken, setAgentToken] = useState("")
   const [response, setResponse] = useState<InstallResponse | null>(null)
-  const [tick, setTick] = useState(0)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [copyState, setCopyState] = useState<"idle" | "copied">("idle")
@@ -114,25 +103,11 @@ export default function EdgeInstallPage() {
     return CATEGORY_LABELS[normalized] ?? normalized
   }, [response?.nodeCategory])
 
-  const timeLeft = useMemo(
-    () => formatRemaining(response?.expiresAtIso ?? null),
-    [response?.expiresAtIso, tick],
-  )
-
   useEffect(() => {
     if (copyState !== "copied") return
     const timer = setTimeout(() => setCopyState("idle"), 2200)
     return () => clearTimeout(timer)
   }, [copyState])
-
-  useEffect(() => {
-    if (!response?.expiresAtIso) return
-    setTick(0)
-    const interval = setInterval(() => {
-      setTick((value) => value + 1)
-    }, 1000)
-    return () => clearInterval(interval)
-  }, [response?.expiresAtIso])
 
   const generateCommand = useCallback(
     async (copyAfter = false) => {
@@ -158,11 +133,6 @@ export default function EdgeInstallPage() {
             nodeName: nodeName.trim() || undefined,
             nodeCategory: category,
             groupId: groupId || undefined,
-            ttlMinutes: Math.min(Math.max(ttlMinutes, MIN_TTL), MAX_TTL),
-            version: version.trim() || undefined,
-            reloadCmd: reloadCmd.trim() || undefined,
-            outputPath: outputPath.trim() || undefined,
-            streamOutputPath: streamOutputPath.trim() || undefined,
             agentToken: agentToken.trim() || undefined,
           }),
           credentials: "include",
@@ -184,11 +154,6 @@ export default function EdgeInstallPage() {
         if (!agentToken && data.agentToken) {
           setAgentToken(data.agentToken)
         }
-        if (!streamOutputPath && data.streamOutputPath) {
-          setStreamOutputPath(data.streamOutputPath)
-        }
-        setTick(0)
-
         if (copyAfter && data.command) {
           if (typeof navigator === "undefined" || !navigator.clipboard) {
             setError("当前环境不支持自动复制，请手动复制命令")
@@ -206,7 +171,7 @@ export default function EdgeInstallPage() {
         setLoading(false)
       }
     },
-    [nodeName, category, groupId, ttlMinutes, version, reloadCmd, outputPath, streamOutputPath, agentToken],
+    [nodeName, category, groupId, agentToken],
   )
 
   const handleCopy = useCallback(async () => {
@@ -224,8 +189,10 @@ export default function EdgeInstallPage() {
   }, [response])
 
   const commandFooter = response
-    ? `命令将在 ${timeLeft} 后失效，节点 ID 已自动生成为 ${response.nodeId}。`
-    : "命令有效期默认为 30 分钟，系统会自动生成唯一节点 ID。"
+    ? response.autoGeneratesNodeId
+      ? "执行命令后，节点会在首次注册时自动生成唯一 ID。"
+      : `节点 ID 已锁定为 ${response.nodeId ?? "（未返回）"}。`
+    : "执行命令后，节点会在首次注册时自动生成唯一 ID。"
 
   const linuxCard = (
     <div className="grid w-56 place-items-center rounded-lg border border-border bg-background/60 p-6 text-center shadow-sm">
@@ -264,6 +231,38 @@ export default function EdgeInstallPage() {
       </header>
 
       <div className="flex-1 space-y-10 overflow-auto px-8 py-10">
+        <section className="space-y-4">
+          <h2 className="text-lg font-semibold text-foreground">运行环境要求</h2>
+          <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+            <div className="rounded-lg border border-border bg-muted/30 p-4">
+              <h3 className="text-sm font-semibold text-foreground">通过验证的发行版</h3>
+              <ul className="mt-3 space-y-2 text-sm text-muted-foreground">
+                {SUPPORTED_OS_GROUPS.map((group) => (
+                  <li key={group.title}>
+                    <p className="font-medium text-foreground">{group.title}</p>
+                    <p>{group.entries.join("，")}</p>
+                  </li>
+                ))}
+              </ul>
+            </div>
+            <div className="rounded-lg border border-border bg-muted/30 p-4">
+              <h3 className="text-sm font-semibold text-foreground">资源配置建议</h3>
+              <dl className="mt-3 space-y-2 text-sm text-muted-foreground">
+                {RESOURCE_REQUIREMENTS.map((item) => (
+                  <div key={item.label} className="flex justify-between gap-2">
+                    <dt className="font-medium text-foreground">{item.label}</dt>
+                    <dd>{item.value}</dd>
+                  </div>
+                ))}
+              </dl>
+            </div>
+            <div className="rounded-lg border border-border bg-muted/30 p-4">
+              <h3 className="text-sm font-semibold text-foreground">网络连通性</h3>
+              <p className="mt-3 text-sm text-muted-foreground">{NETWORK_REQUIREMENT}</p>
+            </div>
+          </div>
+        </section>
+
         <section>
           <h2 className="text-lg font-semibold text-foreground">选择运行环境</h2>
           <p className="mt-2 text-sm text-muted-foreground">当前提供 Linux x86_64 一键脚本，执行时需具有 sudo 权限。</p>
@@ -348,74 +347,9 @@ export default function EdgeInstallPage() {
               2
             </span>
             <div>
-              <h3 className="text-base font-semibold text-foreground">高级参数（可选）</h3>
-              <p className="text-sm text-muted-foreground">若需自定义版本、输出目录或 Reload 命令，可在此覆盖。</p>
-            </div>
-          </div>
-
-          <div className="ml-12 grid gap-4 md:grid-cols-3">
-            <div>
-              <label className="text-sm font-medium text-foreground">令牌有效期（分钟）</label>
-              <Input
-                type="number"
-                min={MIN_TTL}
-                max={MAX_TTL}
-                value={ttlMinutes}
-                onChange={(event) => setTtlMinutes(Number(event.target.value) || 30)}
-              />
-            </div>
-            <div>
-              <label className="text-sm font-medium text-foreground">Agent 版本（可选）</label>
-              <Input
-                placeholder="默认 latest"
-                value={version}
-                onChange={(event) => setVersion(event.target.value)}
-              />
-            </div>
-            <div>
-              <label className="text-sm font-medium text-foreground">Reload 命令（可选）</label>
-              <Input
-                placeholder='默认 "nginx -s reload"'
-                value={reloadCmd}
-                onChange={(event) => setReloadCmd(event.target.value)}
-              />
-            </div>
-            <div>
-              <label className="text-sm font-medium text-foreground">HTTP 配置输出路径（可选）</label>
-              <Input
-                placeholder="默认写入 /etc/nginx/conf.d/anyproxy-<节点>.conf"
-                value={outputPath}
-                onChange={(event) => setOutputPath(event.target.value)}
-              />
-            </div>
-            <div>
-              <label className="text-sm font-medium text-foreground">隧道配置输出路径（可选）</label>
-              <Input
-                placeholder="默认写入 /etc/nginx/stream.d/anyproxy-<节点>.conf"
-                value={streamOutputPath}
-                onChange={(event) => setStreamOutputPath(event.target.value)}
-              />
-            </div>
-            <div className="md:col-span-3">
-              <label className="text-sm font-medium text-foreground">Agent 访问令牌（可选）</label>
-              <Input
-                placeholder="为边缘节点预置控制平面访问令牌，可留空手动下发"
-                value={agentToken}
-                onChange={(event) => setAgentToken(event.target.value)}
-              />
-            </div>
-          </div>
-        </section>
-
-        <section className="space-y-6">
-          <div className="flex items-center gap-4">
-            <span className="flex h-8 w-8 items-center justify-center rounded-full bg-primary text-sm font-semibold text-primary-foreground">
-              3
-            </span>
-            <div>
               <h3 className="text-base font-semibold text-foreground">生成安装命令</h3>
               <p className="text-sm text-muted-foreground">
-                命令有效期有限，请尽快执行。系统将自动携带节点 ID、名称和分组信息。
+                命令会包含控制平面地址与可选信息，节点 ID 将在安装脚本运行时自动生成。
               </p>
             </div>
           </div>
@@ -455,16 +389,8 @@ export default function EdgeInstallPage() {
                 className="min-h-32 bg-muted/40 font-mono text-sm"
                 value={response?.command ?? ""}
                 readOnly
-                placeholder="点击“生成并复制”获取专属安装命令"
+                placeholder="点击「生成并复制」获取专属安装命令"
               />
-              {response?.expiresAtIso && (
-                <div className="absolute right-3 top-3">
-                  <Badge variant="secondary" className="flex items-center gap-1">
-                    <Timer className="h-3 w-3" />
-                    {timeLeft}
-                  </Badge>
-                </div>
-              )}
             </div>
 
             <p className="flex items-start gap-2 text-sm text-muted-foreground">
@@ -475,7 +401,10 @@ export default function EdgeInstallPage() {
             {response ? (
               <div className="space-y-1 rounded-md bg-muted/30 p-3 text-xs text-muted-foreground">
                 <p>
-                  节点 ID：<span className="font-mono text-foreground">{response.nodeId}</span>
+                  节点 ID：
+                  <span className="font-mono text-foreground">
+                    {response.nodeId ?? "安装时自动生成"}
+                  </span>
                 </p>
                 {response.nodeName ? (
                   <p>
@@ -507,7 +436,7 @@ export default function EdgeInstallPage() {
         <section className="space-y-6">
           <div className="flex items-center gap-4">
             <span className="flex h-8 w-8 items-center justify-center rounded-full bg-primary text-sm font-semibold text-primary-foreground">
-              4
+              3
             </span>
             <div>
               <h3 className="text-base font-semibold text-foreground">运行后检查</h3>
@@ -519,15 +448,15 @@ export default function EdgeInstallPage() {
 
           <ul className="ml-12 list-disc space-y-2 text-sm text-muted-foreground">
             <li>
-              脚本会生成 <code>{`anyproxy-edge-${response?.nodeId || "<节点ID>"}.service`}</code>{" "}
+              脚本会生成 <code>{`anyproxy-edge-${response?.nodeId ?? "<自动生成的节点ID>"}.service`}</code>{" "}
               与{" "}
-              <code>{`anyproxy-tunnel-${response?.nodeId || "<节点ID>"}.service`}</code>，确保服务状态为 active。
+              <code>{`anyproxy-tunnel-${response?.nodeId ?? "<自动生成的节点ID>"}.service`}</code>，确保服务状态为 active。
             </li>
             <li>
               如需卸载，可执行{" "}
-              <code>{`sudo systemctl disable --now anyproxy-edge-${response?.nodeId || "<节点ID>"}`}</code>{" "}
+              <code>{`sudo systemctl disable --now anyproxy-edge-${response?.nodeId ?? "<自动生成的节点ID>"}`}</code>{" "}
               与{" "}
-              <code>{`sudo systemctl disable --now anyproxy-tunnel-${response?.nodeId || "<节点ID>"}`}</code>{" "}
+              <code>{`sudo systemctl disable --now anyproxy-tunnel-${response?.nodeId ?? "<自动生成的节点ID>"}`}</code>{" "}
               并删除对应配置文件。
             </li>
             <li>
@@ -542,7 +471,7 @@ export default function EdgeInstallPage() {
             <div>
               <h3 className="text-base font-semibold text-foreground">安全提醒</h3>
               <p className="text-sm text-muted-foreground">
-                令牌超时后会自动失效，可在主控节点定期清理 `/opt/anyproxy/install/tokens` 目录，避免堆积。
+                脚本无需临时令牌，请确保控制平面地址及可选的 Agent 访问令牌仅对受信网络可见；如泄露，可立即变更控制平面入口或刷新访问令牌。
               </p>
             </div>
           </div>
