@@ -8,9 +8,12 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
+	"sort"
 	"strings"
 	"time"
 
@@ -27,6 +30,9 @@ type EdgeOptions struct {
 	ClientCADir     string
 	TemplatePath    string
 	AuthToken       string
+	GroupID         string
+	NodeName        string
+	NodeCategory    string
 	ReloadCommand   []string
 	WatchTimeout    time.Duration
 	RetryInterval   time.Duration
@@ -37,18 +43,41 @@ type EdgeOptions struct {
 
 // EdgeAgent watches the control plane for domain updates and renders nginx config.
 type EdgeAgent struct {
-	opts    EdgeOptions
-	baseURL string
-	client  HTTPClient
-	logger  Logger
-	version int64
+	opts         EdgeOptions
+	baseURL      string
+	client       HTTPClient
+	logger       Logger
+	version      int64
+	groupID      string
+	nodeName     string
+	nodeCategory string
+	lastReg      time.Time
+}
+
+const edgeRegisterInterval = time.Minute
+
+type nodeRegisterRequest struct {
+	NodeID    string   `json:"nodeId"`
+	Kind      string   `json:"kind"`
+	Name      string   `json:"name,omitempty"`
+	Category  string   `json:"category,omitempty"`
+	Hostname  string   `json:"hostname,omitempty"`
+	Addresses []string `json:"addresses,omitempty"`
+	Version   string   `json:"version,omitempty"`
+	GroupID   string   `json:"groupId,omitempty"`
+}
+
+type nodeRegisterResponse struct {
+	Node configstore.EdgeNode `json:"node"`
 }
 
 // NewEdgeAgent prepares an edge agent with sane defaults.
 func NewEdgeAgent(opts EdgeOptions) (*EdgeAgent, error) {
+	opts.NodeID = strings.TrimSpace(opts.NodeID)
 	if opts.NodeID == "" {
 		return nil, fmt.Errorf("node id is required")
 	}
+
 	if opts.OutputPath == "" {
 		return nil, fmt.Errorf("output path is required")
 	}
@@ -88,11 +117,16 @@ func NewEdgeAgent(opts EdgeOptions) (*EdgeAgent, error) {
 		return nil, fmt.Errorf("ensure client CA dir: %w", err)
 	}
 
+	category := strings.ToLower(strings.TrimSpace(opts.NodeCategory))
+
 	return &EdgeAgent{
-		opts:    opts,
-		baseURL: baseURL,
-		client:  client,
-		logger:  logger,
+		opts:         opts,
+		baseURL:      baseURL,
+		client:       client,
+		logger:       logger,
+		groupID:      strings.TrimSpace(opts.GroupID),
+		nodeName:     strings.TrimSpace(opts.NodeName),
+		nodeCategory: category,
 	}, nil
 }
 
@@ -106,6 +140,10 @@ func (a *EdgeAgent) Run(ctx context.Context) error {
 			a.logger.Printf("[edge] context closed, stopping: %v", ctx.Err())
 			return ctx.Err()
 		default:
+		}
+
+		if err := a.maybeRegister(ctx); err != nil {
+			a.logger.Printf("[edge] node register failed: %v", err)
 		}
 
 		snap, changed, err := a.fetchSnapshot(ctx, a.version)
@@ -186,6 +224,9 @@ func (a *EdgeAgent) applySnapshot(ctx context.Context, snap configstore.ConfigSn
 	data.GeneratedAt = time.Now().UTC()
 	data.NodeID = a.opts.NodeID
 	data.Version = snap.Version
+	if group := lookupNodeGroup(snap.Nodes, a.opts.NodeID); group != "" {
+		a.groupID = group
+	}
 
 	if err := templates.RenderEdge(data, a.opts.OutputPath, a.opts.TemplatePath); err != nil {
 		return fmt.Errorf("render edge template: %w", err)
@@ -459,6 +500,151 @@ func formatDuration(d time.Duration) string {
 		return ""
 	}
 	return d.String()
+}
+
+func lookupNodeGroup(nodes []configstore.EdgeNode, nodeID string) string {
+	for _, node := range nodes {
+		if node.ID == nodeID {
+			return node.GroupID
+		}
+	}
+	return ""
+}
+
+func (a *EdgeAgent) maybeRegister(ctx context.Context) error {
+	if time.Since(a.lastReg) < edgeRegisterInterval {
+		return nil
+	}
+	if err := a.registerNode(ctx); err != nil {
+		return err
+	}
+	a.lastReg = time.Now()
+	return nil
+}
+
+func (a *EdgeAgent) registerNode(ctx context.Context) error {
+	hostname, _ := os.Hostname()
+	ips := gatherLocalIPs()
+
+	payload := nodeRegisterRequest{
+		NodeID:    a.opts.NodeID,
+		Kind:      "edge",
+		Hostname:  hostname,
+		Addresses: ips,
+		Version:   runtime.Version(),
+	}
+	if grp := strings.TrimSpace(a.groupID); grp != "" {
+		payload.GroupID = grp
+	}
+	if name := strings.TrimSpace(a.nodeName); name != "" {
+		payload.Name = name
+	}
+	if cat := strings.TrimSpace(a.nodeCategory); cat != "" {
+		payload.Category = strings.ToLower(cat)
+	}
+	if a.groupID != "" {
+		payload.GroupID = a.groupID
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("marshal register payload: %w", err)
+	}
+
+	url := fmt.Sprintf("%s/v1/nodes/register", a.baseURL)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("build register request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if token := strings.TrimSpace(a.opts.AuthToken); token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("register request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 300 {
+		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return fmt.Errorf("register request status %d: %s", resp.StatusCode, string(bodyBytes))
+	}
+
+	var out nodeRegisterResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return fmt.Errorf("decode register response: %w", err)
+	}
+
+	if out.Node.GroupID != "" {
+		a.groupID = out.Node.GroupID
+	}
+	if strings.TrimSpace(out.Node.Name) != "" {
+		a.nodeName = out.Node.Name
+	}
+	if cat := strings.TrimSpace(string(out.Node.Category)); cat != "" {
+		a.nodeCategory = strings.ToLower(cat)
+	}
+	a.logger.Printf("[edge] registered node=%s group=%s addrs=%v", a.opts.NodeID, a.groupID, ips)
+	return nil
+}
+
+func gatherLocalIPs() []string {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil
+	}
+
+	var ips []string
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			var ip net.IP
+			switch v := addr.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+			if ip == nil || ip.IsLoopback() {
+				continue
+			}
+			ip = ip.To4()
+			if ip == nil {
+				continue
+			}
+			ips = append(ips, ip.String())
+		}
+	}
+
+	sort.Strings(ips)
+	return uniqueStrings(ips)
+}
+
+func uniqueStrings(values []string) []string {
+	if len(values) == 0 {
+		return values
+	}
+	result := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, v := range values {
+		if v == "" {
+			continue
+		}
+		if _, ok := seen[v]; ok {
+			continue
+		}
+		seen[v] = struct{}{}
+		result = append(result, v)
+	}
+	return result
 }
 
 func toTemplateScope(scope configstore.PolicyScope) templates.PolicyScope {

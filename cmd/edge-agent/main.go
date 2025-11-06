@@ -23,6 +23,9 @@ func main() {
 		authToken    = flag.String("auth-token", "", "Optional bearer token used to authenticate against control plane")
 		reloadCmdRaw = flag.String("reload", "openresty -s reload", "Command used to reload nginx/openresty (space separated)")
 		dryRun       = flag.Bool("dry-run", false, "Render config but skip reload commands")
+		groupID      = flag.String("group-id", "", "Optional node group identifier used for classification")
+		nodeCategory = flag.String("node-category", "", "Optional node category hint: cdn / tunnel")
+		nodeName     = flag.String("node-name", "", "Optional friendly name for this node")
 	)
 	flag.Parse()
 
@@ -38,6 +41,9 @@ func main() {
 		ClientCADir:     *clientCADir,
 		TemplatePath:    *templatePath,
 		AuthToken:       *authToken,
+		GroupID:         *groupID,
+		NodeCategory:    *nodeCategory,
+		NodeName:        *nodeName,
 		ReloadCommand:   reloadArgs,
 		Logger:          logger,
 		DryRun:          *dryRun,

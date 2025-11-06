@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -63,6 +64,11 @@ func NewServer(store configstore.Store, opts ...Option) *Server {
 func (s *Server) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/healthz", s.handleHealth)
 	mux.HandleFunc("/v1/config/snapshot", s.handleSnapshot)
+	mux.HandleFunc("/v1/nodes/register", s.handleNodeRegister)
+	mux.HandleFunc("/v1/nodes", s.handleNodes)
+	mux.HandleFunc("/v1/nodes/", s.handleNodesByID)
+	mux.HandleFunc("/v1/node-groups", s.handleNodeGroups)
+	mux.HandleFunc("/v1/node-groups/", s.handleNodeGroupsByID)
 	mux.HandleFunc("/v1/domains", s.handleDomains)
 	mux.HandleFunc("/v1/domains/", s.handleDomainsByID)
 	mux.HandleFunc("/v1/tunnels", s.handleTunnels)
@@ -119,6 +125,247 @@ func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, snap)
+}
+
+func (s *Server) handleNodeRegister(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var payload NodeRegisterPayload
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		http.Error(w, fmt.Sprintf("invalid payload: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	nodeID := strings.TrimSpace(payload.NodeID)
+	if nodeID == "" {
+		http.Error(w, "nodeId is required", http.StatusBadRequest)
+		return
+	}
+
+	addresses := append([]string(nil), payload.Addresses...)
+	if remote := extractRemoteIP(r.RemoteAddr); remote != "" {
+		addresses = appendUnique(addresses, remote)
+	}
+
+	category := configstore.NodeCategoryWaiting
+	if payload.Category != "" {
+		if parsed, err := parseNodeCategory(payload.Category); err == nil {
+			category = parsed
+		}
+	}
+
+	reg := configstore.NodeRegistration{
+		ID:        nodeID,
+		Kind:      strings.TrimSpace(payload.Kind),
+		GroupID:   strings.TrimSpace(payload.GroupID),
+		Name:      strings.TrimSpace(payload.Name),
+		Category:  category,
+		Hostname:  strings.TrimSpace(payload.Hostname),
+		Addresses: addresses,
+		Version:   strings.TrimSpace(payload.Version),
+	}
+
+	snap, node, err := s.store.RegisterOrUpdateNode(reg)
+	if err != nil {
+		switch {
+		case errors.Is(err, configstore.ErrInvalidGroup):
+			http.Error(w, err.Error(), http.StatusBadRequest)
+		default:
+			http.Error(w, fmt.Sprintf("store error: %v", err), http.StatusInternalServerError)
+		}
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"node":    node,
+		"version": snap.Version,
+	})
+}
+
+func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		snap, err := s.store.Snapshot(r.Context())
+		if err != nil {
+			http.Error(w, fmt.Sprintf("snapshot error: %v", err), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"nodes":   snap.Nodes,
+			"groups":  snap.NodeGroups,
+			"version": snap.Version,
+		})
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) handleNodesByID(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimPrefix(r.URL.Path, "/v1/nodes/")
+	if id == "" {
+		http.Error(w, "missing node id", http.StatusBadRequest)
+		return
+	}
+
+	switch r.Method {
+	case http.MethodPatch:
+		var payload NodeUpdatePayload
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			http.Error(w, fmt.Sprintf("invalid payload: %v", err), http.StatusBadRequest)
+			return
+		}
+
+		snap, node, err := s.store.UpdateNodeGroup(id, strings.TrimSpace(payload.GroupID))
+		if err != nil {
+			switch {
+			case errors.Is(err, configstore.ErrNodeNotFound):
+				http.Error(w, "not found", http.StatusNotFound)
+			case errors.Is(err, configstore.ErrGroupNotFound):
+				http.Error(w, "group not found", http.StatusNotFound)
+			case errors.Is(err, configstore.ErrInvalidGroup):
+				http.Error(w, err.Error(), http.StatusBadRequest)
+			default:
+				http.Error(w, fmt.Sprintf("store error: %v", err), http.StatusInternalServerError)
+			}
+			return
+		}
+
+		writeJSON(w, http.StatusOK, map[string]any{
+			"node":    node,
+			"version": snap.Version,
+		})
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) handleNodeGroups(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		snap, err := s.store.Snapshot(r.Context())
+		if err != nil {
+			http.Error(w, fmt.Sprintf("snapshot error: %v", err), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"groups":  snap.NodeGroups,
+			"version": snap.Version,
+		})
+	case http.MethodPost:
+		var payload NodeGroupPayload
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			http.Error(w, fmt.Sprintf("invalid payload: %v", err), http.StatusBadRequest)
+			return
+		}
+
+		group, err := payload.toNodeGroup(nil)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("validation error: %v", err), http.StatusBadRequest)
+			return
+		}
+
+		snap, stored, err := s.store.UpsertNodeGroup(group)
+		if err != nil {
+			switch {
+			case errors.Is(err, configstore.ErrInvalidGroup):
+				http.Error(w, err.Error(), http.StatusBadRequest)
+			case errors.Is(err, configstore.ErrProtectedGroup):
+				http.Error(w, err.Error(), http.StatusForbidden)
+			default:
+				http.Error(w, fmt.Sprintf("store error: %v", err), http.StatusInternalServerError)
+			}
+			return
+		}
+
+		writeJSON(w, http.StatusCreated, map[string]any{
+			"group":   stored,
+			"version": snap.Version,
+		})
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) handleNodeGroupsByID(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimPrefix(r.URL.Path, "/v1/node-groups/")
+	if id == "" {
+		http.Error(w, "missing group id", http.StatusBadRequest)
+		return
+	}
+
+	switch r.Method {
+	case http.MethodPatch:
+		var payload NodeGroupPayload
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			http.Error(w, fmt.Sprintf("invalid payload: %v", err), http.StatusBadRequest)
+			return
+		}
+		payload.ID = id
+
+		snap, err := s.store.Snapshot(r.Context())
+		if err != nil {
+			http.Error(w, fmt.Sprintf("snapshot error: %v", err), http.StatusInternalServerError)
+			return
+		}
+		var existing *configstore.NodeGroup
+		for i := range snap.NodeGroups {
+			if snap.NodeGroups[i].ID == id {
+				existing = &snap.NodeGroups[i]
+				break
+			}
+		}
+		if existing == nil {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+
+		group, err := payload.toNodeGroup(existing)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("validation error: %v", err), http.StatusBadRequest)
+			return
+		}
+		group.ID = id
+
+		snap, stored, err := s.store.UpsertNodeGroup(group)
+		if err != nil {
+			switch {
+			case errors.Is(err, configstore.ErrInvalidGroup):
+				http.Error(w, err.Error(), http.StatusBadRequest)
+			case errors.Is(err, configstore.ErrProtectedGroup):
+				http.Error(w, err.Error(), http.StatusForbidden)
+			default:
+				http.Error(w, fmt.Sprintf("store error: %v", err), http.StatusInternalServerError)
+			}
+			return
+		}
+
+		writeJSON(w, http.StatusOK, map[string]any{
+			"group":   stored,
+			"version": snap.Version,
+		})
+	case http.MethodDelete:
+		snap, err := s.store.DeleteNodeGroup(id)
+		if err != nil {
+			switch {
+			case errors.Is(err, configstore.ErrGroupNotFound):
+				http.Error(w, "not found", http.StatusNotFound)
+			case errors.Is(err, configstore.ErrProtectedGroup):
+				http.Error(w, err.Error(), http.StatusForbidden)
+			default:
+				http.Error(w, fmt.Sprintf("store error: %v", err), http.StatusInternalServerError)
+			}
+			return
+		}
+
+		writeJSON(w, http.StatusOK, map[string]any{
+			"version": snap.Version,
+		})
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
 }
 
 func (s *Server) handleDomains(w http.ResponseWriter, r *http.Request) {
@@ -491,6 +738,63 @@ type stdLogger struct{}
 
 func (stdLogger) Printf(format string, v ...any) {
 	fmt.Printf(format+"\n", v...)
+}
+
+type NodeGroupPayload struct {
+	ID          string `json:"id,omitempty"`
+	Name        string `json:"name"`
+	Category    string `json:"category"`
+	Description string `json:"description,omitempty"`
+}
+
+func (p NodeGroupPayload) toNodeGroup(existing *configstore.NodeGroup) (configstore.NodeGroup, error) {
+	var group configstore.NodeGroup
+	if existing != nil {
+		group = *existing
+	}
+
+	if id := strings.TrimSpace(p.ID); id != "" {
+		group.ID = id
+	} else if existing == nil {
+		group.ID = ""
+	}
+
+	if name := strings.TrimSpace(p.Name); name != "" {
+		group.Name = name
+	} else if existing == nil || strings.TrimSpace(group.Name) == "" {
+		return configstore.NodeGroup{}, errors.New("name is required")
+	}
+
+	if desc := strings.TrimSpace(p.Description); desc != "" || existing == nil {
+		group.Description = desc
+	}
+
+	if catRaw := strings.TrimSpace(p.Category); catRaw != "" {
+		category, err := parseNodeCategory(catRaw)
+		if err != nil {
+			return configstore.NodeGroup{}, err
+		}
+		group.Category = category
+	} else if existing == nil {
+		return configstore.NodeGroup{}, errors.New("category is required")
+	}
+
+	return group, nil
+}
+
+type NodeRegisterPayload struct {
+	NodeID    string   `json:"nodeId"`
+	Kind      string   `json:"kind,omitempty"`
+	Name      string   `json:"name,omitempty"`
+	Category  string   `json:"category,omitempty"`
+	Hostname  string   `json:"hostname,omitempty"`
+	Addresses []string `json:"addresses,omitempty"`
+	Version   string   `json:"version,omitempty"`
+	GroupID   string   `json:"groupId,omitempty"`
+}
+
+type NodeUpdatePayload struct {
+	GroupID string `json:"groupId"`
 }
 
 // DomainPayload describes the REST payload for domain routes.
@@ -1035,6 +1339,44 @@ func copyStringSlice(src []string) []string {
 		dst[i] = strings.TrimSpace(v)
 	}
 	return dst
+}
+
+func parseNodeCategory(raw string) (configstore.NodeCategory, error) {
+	switch val := strings.ToLower(strings.TrimSpace(raw)); val {
+	case "waiting", "pending", "unassigned", "待分组":
+		return configstore.NodeCategoryWaiting, nil
+	case "cdn":
+		return configstore.NodeCategoryCDN, nil
+	case "tunnel", "penetration", "intranet", "内网穿透":
+		return configstore.NodeCategoryTunnel, nil
+	default:
+		return "", fmt.Errorf("invalid node category: %s", raw)
+	}
+}
+
+func appendUnique(items []string, value string) []string {
+	val := strings.TrimSpace(value)
+	if val == "" {
+		return items
+	}
+	for _, item := range items {
+		if item == val {
+			return items
+		}
+	}
+	return append(items, val)
+}
+
+func extractRemoteIP(remoteAddr string) string {
+	addr := strings.TrimSpace(remoteAddr)
+	if addr == "" {
+		return ""
+	}
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return addr
+	}
+	return strings.TrimSpace(host)
 }
 
 // Validate checks the tunnel input.

@@ -4,8 +4,11 @@ import type {
   Condition,
   ConfigSnapshot,
   DomainRoute,
+  EdgeNode,
   HeaderMutation,
   Matcher,
+  NodeCategory,
+  NodeGroup,
   PolicyScope,
   RewriteActions,
   RewriteRule,
@@ -212,6 +215,49 @@ function normaliseRewriteRule(raw: any): RewriteRule {
   }
 }
 
+function normaliseNodeCategory(value: any): NodeCategory {
+  const lowered = toStringValue(value)?.toLowerCase()
+  switch (lowered) {
+    case "cdn":
+      return "cdn"
+    case "tunnel":
+    case "penetration":
+      return "tunnel"
+    case "waiting":
+    case "pending":
+    case "unassigned":
+    default:
+      return "waiting"
+  }
+}
+
+function normaliseNodeGroup(raw: any): NodeGroup {
+  return {
+    id: String(raw?.id ?? generateId()),
+    name: String(raw?.name ?? ""),
+    category: normaliseNodeCategory(raw?.category),
+    description: toStringValue(raw?.description),
+    system: Boolean(raw?.system),
+    createdAt: toStringValue(raw?.createdAt),
+    updatedAt: toStringValue(raw?.updatedAt),
+  }
+}
+
+function normaliseEdgeNode(raw: any): EdgeNode {
+  return {
+    id: String(raw?.id ?? ""),
+    groupId: toStringValue(raw?.groupId) ?? "",
+    category: normaliseNodeCategory(raw?.category),
+    kind: toStringValue(raw?.kind) ?? "edge",
+    hostname: toStringValue(raw?.hostname),
+    addresses: toStringArray(raw?.addresses).filter((addr) => addr.length > 0),
+    version: toStringValue(raw?.version),
+    lastSeen: toStringValue(raw?.lastSeen),
+    createdAt: toStringValue(raw?.createdAt),
+    updatedAt: toStringValue(raw?.updatedAt),
+  }
+}
+
 function normaliseUpstream(raw: any): Upstream {
   return {
     address: String(raw?.address ?? ""),
@@ -279,6 +325,138 @@ function normaliseSnapshot(raw: any): ConfigSnapshot {
     accessPolicies,
     rewriteRules,
   }
+}
+
+export async function fetchNodeGroups(token: string): Promise<NodeGroup[]> {
+  const url = new URL("/v1/node-groups", resolveControlPlaneURL())
+  const response = await fetch(url.toString(), {
+    headers: {
+      Authorization: `Bearer ${token}`,
+    },
+    credentials: "include",
+  })
+  if (!response.ok) {
+    const detail = await response.json().catch(() => ({}))
+    throw new Error(detail?.error || `加载节点分组失败：${response.statusText}`)
+  }
+  const data = await response.json()
+  return Array.isArray(data?.groups) ? data.groups.map(normaliseNodeGroup) : []
+}
+
+export interface NodeInventory {
+  nodes: EdgeNode[]
+  groups: NodeGroup[]
+  version: number
+}
+
+export async function fetchNodeInventory(token: string): Promise<NodeInventory> {
+  const url = new URL("/v1/nodes", resolveControlPlaneURL())
+  const response = await fetch(url.toString(), {
+    headers: {
+      Authorization: `Bearer ${token}`,
+    },
+    credentials: "include",
+  })
+  if (!response.ok) {
+    throw new Error(`加载节点失败：${response.statusText}`)
+  }
+
+  const data = await response.json()
+  const nodes = Array.isArray(data?.nodes) ? data.nodes.map(normaliseEdgeNode) : []
+  const groups = Array.isArray(data?.groups) ? data.groups.map(normaliseNodeGroup) : []
+  return {
+    nodes,
+    groups,
+    version: Number(data?.version ?? 0),
+  }
+}
+
+export async function createNodeGroupRequest(
+  token: string,
+  payload: { name: string; category: NodeCategory; description?: string },
+): Promise<NodeGroup> {
+  const url = new URL("/v1/node-groups", resolveControlPlaneURL())
+  const response = await fetch(url.toString(), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    credentials: "include",
+    body: JSON.stringify({
+      name: payload.name,
+      category: payload.category,
+      description: payload.description,
+    }),
+  })
+  if (!response.ok) {
+    const detail = await response.json().catch(() => ({}))
+    throw new Error(detail?.error || `创建分组失败：${response.statusText}`)
+  }
+  const data = await response.json()
+  return normaliseNodeGroup(data?.group)
+}
+
+export async function updateNodeGroupRequest(
+  token: string,
+  id: string,
+  payload: { name: string; description?: string },
+): Promise<NodeGroup> {
+  const url = new URL(`/v1/node-groups/${id}`, resolveControlPlaneURL())
+  const response = await fetch(url.toString(), {
+    method: "PATCH",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    credentials: "include",
+    body: JSON.stringify({
+      name: payload.name,
+      description: payload.description,
+    }),
+  })
+  if (!response.ok) {
+    const detail = await response.json().catch(() => ({}))
+    throw new Error(detail?.error || `更新分组失败：${response.statusText}`)
+  }
+  const data = await response.json()
+  return normaliseNodeGroup(data?.group)
+}
+
+export async function deleteNodeGroupRequest(token: string, id: string): Promise<void> {
+  const url = new URL(`/v1/node-groups/${id}`, resolveControlPlaneURL())
+  const response = await fetch(url.toString(), {
+    method: "DELETE",
+    headers: {
+      Authorization: `Bearer ${token}`,
+    },
+    credentials: "include",
+  })
+  if (!response.ok) {
+    const detail = await response.json().catch(() => ({}))
+    throw new Error(detail?.error || `删除分组失败：${response.statusText}`)
+  }
+}
+
+export async function moveNodeToGroupRequest(token: string, nodeId: string, groupId: string | null): Promise<EdgeNode> {
+  const url = new URL(`/v1/nodes/${nodeId}`, resolveControlPlaneURL())
+  const response = await fetch(url.toString(), {
+    method: "PATCH",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    credentials: "include",
+    body: JSON.stringify({
+      groupId: groupId ?? undefined,
+    }),
+  })
+  if (!response.ok) {
+    const detail = await response.json().catch(() => ({}))
+    throw new Error(detail?.error || `调整分组失败：${response.statusText}`)
+  }
+  const data = await response.json()
+  return normaliseEdgeNode(data?.node)
 }
 
 export async function fetchSnapshot(token: string): Promise<ConfigSnapshot> {

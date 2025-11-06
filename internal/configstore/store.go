@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -26,6 +27,10 @@ type Store interface {
 	DeleteAccessPolicy(id string) (ConfigSnapshot, error)
 	UpsertRewriteRule(rule RewriteRule) (ConfigSnapshot, error)
 	DeleteRewriteRule(id string) (ConfigSnapshot, error)
+	UpsertNodeGroup(group NodeGroup) (ConfigSnapshot, NodeGroup, error)
+	DeleteNodeGroup(id string) (ConfigSnapshot, error)
+	RegisterOrUpdateNode(reg NodeRegistration) (ConfigSnapshot, EdgeNode, error)
+	UpdateNodeGroup(nodeID, groupID string) (ConfigSnapshot, EdgeNode, error)
 }
 
 // DomainRoute represents a domain level forwarding rule that an edge node should proxy.
@@ -146,16 +151,16 @@ const (
 
 // AccessPolicy controls request admission.
 type AccessPolicy struct {
-	ID           string        `json:"id"`
-	Name         string        `json:"name"`
-	Description  string        `json:"description,omitempty"`
-	Scope        PolicyScope   `json:"scope"`
-	Condition    Condition     `json:"condition"`
-	Action       AccessAction  `json:"action"`
-	ResponseCode int           `json:"responseCode,omitempty"`
-	RedirectURL  string        `json:"redirectUrl,omitempty"`
-	CreatedAt    time.Time     `json:"createdAt"`
-	UpdatedAt    time.Time     `json:"updatedAt"`
+	ID           string       `json:"id"`
+	Name         string       `json:"name"`
+	Description  string       `json:"description,omitempty"`
+	Scope        PolicyScope  `json:"scope"`
+	Condition    Condition    `json:"condition"`
+	Action       AccessAction `json:"action"`
+	ResponseCode int          `json:"responseCode,omitempty"`
+	RedirectURL  string       `json:"redirectUrl,omitempty"`
+	CreatedAt    time.Time    `json:"createdAt"`
+	UpdatedAt    time.Time    `json:"updatedAt"`
 }
 
 // HeaderMutation represents a header modification.
@@ -184,11 +189,11 @@ type UpstreamOverride struct {
 
 // RewriteActions encapsulates supported rewrite mutations.
 type RewriteActions struct {
-	SNIOverride     string             `json:"sniOverride,omitempty"`
-	HostOverride    string             `json:"hostOverride,omitempty"`
-	URL             URLRewrite         `json:"url,omitempty"`
-	Headers         []HeaderMutation   `json:"headers,omitempty"`
-	Upstream        *UpstreamOverride  `json:"upstream,omitempty"`
+	SNIOverride  string            `json:"sniOverride,omitempty"`
+	HostOverride string            `json:"hostOverride,omitempty"`
+	URL          URLRewrite        `json:"url,omitempty"`
+	Headers      []HeaderMutation  `json:"headers,omitempty"`
+	Upstream     *UpstreamOverride `json:"upstream,omitempty"`
 }
 
 // RewriteRule mutates outgoing origin requests.
@@ -204,48 +209,139 @@ type RewriteRule struct {
 	UpdatedAt   time.Time      `json:"updatedAt"`
 }
 
-// ConfigSnapshot is the immutable configuration artefact that agents consume.
-type ConfigSnapshot struct {
-	Version     int64         `json:"version"`
-	GeneratedAt time.Time     `json:"generatedAt"`
-	Domains     []DomainRoute `json:"domains"`
-	Tunnels     []TunnelRoute `json:"tunnels"`
-	Certificates []Certificate `json:"certificates"`
-	SSLPolicies []SSLPolicy `json:"sslPolicies"`
-	AccessPolicies []AccessPolicy `json:"accessPolicies"`
-	RewriteRules []RewriteRule `json:"rewriteRules"`
+// NodeCategory classifies a node's high level capability.
+type NodeCategory string
+
+const (
+	NodeCategoryWaiting NodeCategory = "waiting"
+	NodeCategoryCDN     NodeCategory = "cdn"
+	NodeCategoryTunnel  NodeCategory = "tunnel"
+)
+
+// NodeGroup represents a logical grouping under a category.
+type NodeGroup struct {
+	ID          string       `json:"id"`
+	Name        string       `json:"name"`
+	Category    NodeCategory `json:"category"`
+	Description string       `json:"description,omitempty"`
+	System      bool         `json:"system,omitempty"`
+	CreatedAt   time.Time    `json:"createdAt"`
+	UpdatedAt   time.Time    `json:"updatedAt"`
 }
 
-// MemoryStore manages configuration in-memory.
+// EdgeNode stores metadata reported by running agents.
+type EdgeNode struct {
+	ID        string       `json:"id"`
+	GroupID   string       `json:"groupId"`
+	Category  NodeCategory `json:"category"`
+	Kind      string       `json:"kind"`
+	Name      string       `json:"name,omitempty"`
+	Hostname  string       `json:"hostname,omitempty"`
+	Addresses []string     `json:"addresses,omitempty"`
+	Version   string       `json:"version,omitempty"`
+	LastSeen  time.Time    `json:"lastSeen"`
+	CreatedAt time.Time    `json:"createdAt"`
+	UpdatedAt time.Time    `json:"updatedAt"`
+}
+
+// NodeRegistration carries metadata supplied by agents on join/heartbeat.
+type NodeRegistration struct {
+	ID        string
+	Kind      string
+	GroupID   string
+	Name      string
+	Category  NodeCategory
+	Hostname  string
+	Addresses []string
+	Version   string
+}
+
+// ConfigSnapshot is the immutable configuration artefact that agents consume.
+type ConfigSnapshot struct {
+	Version        int64          `json:"version"`
+	GeneratedAt    time.Time      `json:"generatedAt"`
+	Domains        []DomainRoute  `json:"domains"`
+	Tunnels        []TunnelRoute  `json:"tunnels"`
+	Certificates   []Certificate  `json:"certificates"`
+	SSLPolicies    []SSLPolicy    `json:"sslPolicies"`
+	AccessPolicies []AccessPolicy `json:"accessPolicies"`
+	RewriteRules   []RewriteRule  `json:"rewriteRules"`
+	NodeGroups     []NodeGroup    `json:"nodeGroups"`
+	Nodes          []EdgeNode     `json:"nodes"`
+}
+
 type MemoryStore struct {
-	mu            sync.RWMutex
-	version       int64
-	domains       map[string]DomainRoute
-	tunnels       map[string]TunnelRoute
-	certificates  map[string]Certificate
-	sslPolicies   map[string]SSLPolicy
+	mu             sync.RWMutex
+	version        int64
+	domains        map[string]DomainRoute
+	tunnels        map[string]TunnelRoute
+	certificates   map[string]Certificate
+	sslPolicies    map[string]SSLPolicy
 	accessPolicies map[string]AccessPolicy
-	rewriteRules  map[string]RewriteRule
-	watchers      map[int]chan ConfigSnapshot
-	nextWatcherID int
+	rewriteRules   map[string]RewriteRule
+	nodeGroups     map[string]NodeGroup
+	nodes          map[string]EdgeNode
+	watchers       map[int]chan ConfigSnapshot
+	nextWatcherID  int
 }
 
 var (
 	// ErrNotFound indicates the requested record does not exist.
 	ErrNotFound = errors.New("configstore: record not found")
+	// ErrInvalidGroup indicates the supplied node group is invalid.
+	ErrInvalidGroup = errors.New("configstore: invalid node group")
+	// ErrGroupNotFound indicates the referenced node group does not exist.
+	ErrGroupNotFound = errors.New("configstore: node group not found")
+	// ErrNodeNotFound indicates the referenced node is missing.
+	ErrNodeNotFound = errors.New("configstore: node not found")
+	// ErrProtectedGroup indicates a system group cannot be modified.
+	ErrProtectedGroup = errors.New("configstore: protected node group")
 )
 
 // NewMemoryStore returns an initialised MemoryStore.
 func NewMemoryStore() *MemoryStore {
-	return &MemoryStore{
+	store := &MemoryStore{
 		domains:        make(map[string]DomainRoute),
 		tunnels:        make(map[string]TunnelRoute),
-		certificates:  make(map[string]Certificate),
-		sslPolicies:   make(map[string]SSLPolicy),
+		certificates:   make(map[string]Certificate),
+		sslPolicies:    make(map[string]SSLPolicy),
 		accessPolicies: make(map[string]AccessPolicy),
-		rewriteRules:  make(map[string]RewriteRule),
-		watchers:      make(map[int]chan ConfigSnapshot),
+		rewriteRules:   make(map[string]RewriteRule),
+		nodeGroups:     make(map[string]NodeGroup),
+		nodes:          make(map[string]EdgeNode),
+		watchers:       make(map[int]chan ConfigSnapshot),
 	}
+	now := time.Now().UTC()
+	systemGroups := []NodeGroup{
+		{
+			ID:        defaultWaitingGroupID,
+			Name:      "待分组",
+			Category:  NodeCategoryWaiting,
+			System:    true,
+			CreatedAt: now,
+			UpdatedAt: now,
+		},
+		{
+			ID:        defaultCDNGroupID,
+			Name:      "默认 CDN 分组",
+			Category:  NodeCategoryCDN,
+			System:    true,
+			CreatedAt: now,
+			UpdatedAt: now,
+		},
+		{
+			ID:        defaultTunnelGroupID,
+			Name:      "默认内网穿透分组",
+			Category:  NodeCategoryTunnel,
+			System:    true,
+			CreatedAt: now,
+			UpdatedAt: now,
+		},
+	}
+	for _, group := range systemGroups {
+		store.nodeGroups[group.ID] = group
+	}
+	return store
 }
 
 var _ Store = (*MemoryStore)(nil)
@@ -444,6 +540,244 @@ func (s *MemoryStore) DeleteRewriteRule(id string) (ConfigSnapshot, error) {
 	return s.snapshotLocked(), nil
 }
 
+// UpsertNodeGroup creates or updates a logical node group.
+func (s *MemoryStore) UpsertNodeGroup(group NodeGroup) (ConfigSnapshot, NodeGroup, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if strings.TrimSpace(group.Name) == "" {
+		return ConfigSnapshot{}, NodeGroup{}, ErrInvalidGroup
+	}
+	switch group.Category {
+	case NodeCategoryWaiting, NodeCategoryCDN, NodeCategoryTunnel:
+	default:
+		return ConfigSnapshot{}, NodeGroup{}, ErrInvalidGroup
+	}
+
+	now := time.Now().UTC()
+	if group.ID == "" {
+		group.ID = uuid.NewString()
+		group.CreatedAt = now
+		group.UpdatedAt = now
+	} else {
+		existing, ok := s.nodeGroups[group.ID]
+		if ok {
+			if existing.System && existing.Category != group.Category {
+				return ConfigSnapshot{}, NodeGroup{}, ErrProtectedGroup
+			}
+			if group.CreatedAt.IsZero() {
+				group.CreatedAt = existing.CreatedAt
+			}
+			if group.System != existing.System {
+				group.System = existing.System
+			}
+		} else if group.CreatedAt.IsZero() {
+			group.CreatedAt = now
+		}
+		group.UpdatedAt = now
+	}
+	if group.CreatedAt.IsZero() {
+		group.CreatedAt = now
+	}
+	group.UpdatedAt = now
+	if existing, ok := s.nodeGroups[group.ID]; ok {
+		if existing.System {
+			group.System = true
+		}
+	}
+	s.nodeGroups[group.ID] = group
+	s.bumpLocked()
+	return s.snapshotLocked(), group, nil
+}
+
+// DeleteNodeGroup removes a node group and reassigns members to the waiting pool.
+func (s *MemoryStore) DeleteNodeGroup(id string) (ConfigSnapshot, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	group, ok := s.nodeGroups[id]
+	if !ok {
+		return ConfigSnapshot{}, ErrGroupNotFound
+	}
+	if group.System {
+		return ConfigSnapshot{}, ErrProtectedGroup
+	}
+
+	waiting := s.ensureSystemGroupLocked(NodeCategoryWaiting)
+
+	now := time.Now().UTC()
+	for nodeID, node := range s.nodes {
+		if node.GroupID == id {
+			node.GroupID = waiting.ID
+			node.Category = waiting.Category
+			node.UpdatedAt = now
+			s.nodes[nodeID] = node
+		}
+	}
+
+	delete(s.nodeGroups, id)
+	s.bumpLocked()
+	return s.snapshotLocked(), nil
+}
+
+// RegisterOrUpdateNode persists node metadata reported by agents.
+func (s *MemoryStore) RegisterOrUpdateNode(reg NodeRegistration) (ConfigSnapshot, EdgeNode, error) {
+	if strings.TrimSpace(reg.ID) == "" {
+		return ConfigSnapshot{}, EdgeNode{}, ErrNodeNotFound
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var group NodeGroup
+	if id := strings.TrimSpace(reg.GroupID); id != "" {
+		group = s.nodeGroups[id]
+		if group.ID == "" {
+			group = s.ensureSystemGroupLocked(reg.Category)
+		}
+	} else if reg.Category != "" {
+		group = s.ensureSystemGroupLocked(reg.Category)
+	} else {
+		group = s.ensureSystemGroupLocked(NodeCategoryWaiting)
+	}
+
+	now := time.Now().UTC()
+	addresses := uniqueStrings(reg.Addresses)
+
+	node, exists := s.nodes[reg.ID]
+	if !exists {
+		node = EdgeNode{
+			ID:        reg.ID,
+			CreatedAt: now,
+		}
+	}
+
+	changed := !exists
+
+	if node.GroupID != group.ID {
+		node.GroupID = group.ID
+		node.Category = group.Category
+		changed = true
+	}
+
+	if name := strings.TrimSpace(reg.Name); name != "" && name != node.Name {
+		node.Name = name
+		changed = true
+	}
+
+	if kind := strings.TrimSpace(reg.Kind); kind != "" && kind != node.Kind {
+		node.Kind = kind
+		changed = true
+	} else if node.Kind == "" {
+		node.Kind = "edge"
+		changed = true
+	}
+
+	if host := strings.TrimSpace(reg.Hostname); host != "" && host != node.Hostname {
+		node.Hostname = host
+		changed = true
+	}
+
+	if len(addresses) > 0 && !equalStringSlices(node.Addresses, addresses) {
+		node.Addresses = addresses
+		changed = true
+	}
+
+	if ver := strings.TrimSpace(reg.Version); ver != "" && ver != node.Version {
+		node.Version = ver
+		changed = true
+	}
+
+	node.LastSeen = now
+	node.UpdatedAt = now
+
+	s.nodes[node.ID] = node
+	if changed {
+		s.bumpLocked()
+	}
+	return s.snapshotLocked(), node, nil
+}
+
+// UpdateNodeGroup moves a node to the specified group.
+func (s *MemoryStore) UpdateNodeGroup(nodeID, groupID string) (ConfigSnapshot, EdgeNode, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	node, ok := s.nodes[nodeID]
+	if !ok {
+		return ConfigSnapshot{}, EdgeNode{}, ErrNodeNotFound
+	}
+
+	targetID := groupID
+	if strings.TrimSpace(targetID) == "" {
+		targetID = defaultWaitingGroupID
+	}
+	group, ok := s.nodeGroups[targetID]
+	if !ok {
+		return ConfigSnapshot{}, EdgeNode{}, ErrGroupNotFound
+	}
+
+	if node.GroupID == group.ID {
+		return s.snapshotLocked(), node, nil
+	}
+
+	now := time.Now().UTC()
+	node.GroupID = group.ID
+	node.Category = group.Category
+	node.UpdatedAt = now
+	s.nodes[nodeID] = node
+
+	s.bumpLocked()
+	return s.snapshotLocked(), node, nil
+}
+
+func uniqueStrings(values []string) []string {
+	result := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, v := range values {
+		val := strings.TrimSpace(v)
+		if val == "" {
+			continue
+		}
+		if _, ok := seen[val]; ok {
+			continue
+		}
+		seen[val] = struct{}{}
+		result = append(result, val)
+	}
+	return result
+}
+
+func (s *MemoryStore) ensureSystemGroupLocked(category NodeCategory) NodeGroup {
+	id, name := defaultSystemGroupMeta(category)
+	if existing, ok := s.nodeGroups[id]; ok {
+		return existing
+	}
+	now := time.Now().UTC()
+	group := NodeGroup{
+		ID:        id,
+		Name:      name,
+		Category:  category,
+		System:    true,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	s.nodeGroups[id] = group
+	return group
+}
+
+func equalStringSlices(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // Snapshot returns the latest configuration snapshot immediately.
 func (s *MemoryStore) Snapshot(_ context.Context) (ConfigSnapshot, error) {
 	s.mu.RLock()
@@ -566,14 +900,38 @@ func (s *MemoryStore) snapshotLocked() ConfigSnapshot {
 		return rewriteList[i].Priority < rewriteList[j].Priority
 	})
 
+	groupList := make([]NodeGroup, 0, len(s.nodeGroups))
+	for _, v := range s.nodeGroups {
+		groupList = append(groupList, v)
+	}
+	sort.Slice(groupList, func(i, j int) bool {
+		if groupList[i].Category == groupList[j].Category {
+			if groupList[i].Name == groupList[j].Name {
+				return groupList[i].ID < groupList[j].ID
+			}
+			return groupList[i].Name < groupList[j].Name
+		}
+		return groupList[i].Category < groupList[j].Category
+	})
+
+	nodeList := make([]EdgeNode, 0, len(s.nodes))
+	for _, v := range s.nodes {
+		nodeList = append(nodeList, v)
+	}
+	sort.Slice(nodeList, func(i, j int) bool {
+		return nodeList[i].ID < nodeList[j].ID
+	})
+
 	return ConfigSnapshot{
-		Version:     s.version,
-		GeneratedAt: time.Now().UTC(),
-		Domains:     domainList,
-		Tunnels:     tunnelList,
-		Certificates: certificateList,
-		SSLPolicies:  sslPolicyList,
+		Version:        s.version,
+		GeneratedAt:    time.Now().UTC(),
+		Domains:        domainList,
+		Tunnels:        tunnelList,
+		Certificates:   certificateList,
+		SSLPolicies:    sslPolicyList,
 		AccessPolicies: accessPolicyList,
-		RewriteRules:  rewriteList,
+		RewriteRules:   rewriteList,
+		NodeGroups:     groupList,
+		Nodes:          nodeList,
 	}
 }

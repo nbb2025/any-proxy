@@ -23,6 +23,8 @@ const (
 	sslPoliciesDir    = "ssl_policies/"
 	accessPoliciesDir = "access_policies/"
 	rewriteRulesDir   = "rewrite_rules/"
+	nodeGroupsDir     = "node_groups/"
+	nodesDir          = "nodes/"
 )
 
 // EtcdOptions configures EtcdStore behaviour.
@@ -59,11 +61,23 @@ func NewEtcdStore(client *clientv3.Client, opts EtcdOptions) (*EtcdStore, error)
 		timeout = 5 * time.Second
 	}
 
-	return &EtcdStore{
+	store := &EtcdStore{
 		client:  client,
 		prefix:  prefix,
 		timeout: timeout,
-	}, nil
+	}
+
+	if _, err := store.ensureSystemGroup(NodeCategoryWaiting); err != nil {
+		return nil, err
+	}
+	if _, err := store.ensureSystemGroup(NodeCategoryCDN); err != nil {
+		return nil, err
+	}
+	if _, err := store.ensureSystemGroup(NodeCategoryTunnel); err != nil {
+		return nil, err
+	}
+
+	return store, nil
 }
 
 // UpsertDomain inserts or updates a domain definition in etcd.
@@ -136,7 +150,7 @@ func (e *EtcdStore) DeleteTunnel(id string) (ConfigSnapshot, error) {
 		return ConfigSnapshot{}, fmt.Errorf("delete tunnel: %w", err)
 	}
 	if resp.Deleted == 0 {
-	return ConfigSnapshot{}, ErrNotFound
+		return ConfigSnapshot{}, ErrNotFound
 	}
 
 	return e.Snapshot(context.Background())
@@ -306,6 +320,260 @@ func (e *EtcdStore) DeleteRewriteRule(id string) (ConfigSnapshot, error) {
 	return e.Snapshot(context.Background())
 }
 
+// UpsertNodeGroup stores or updates node group metadata.
+func (e *EtcdStore) UpsertNodeGroup(group NodeGroup) (ConfigSnapshot, NodeGroup, error) {
+	if strings.TrimSpace(group.Name) == "" {
+		return ConfigSnapshot{}, NodeGroup{}, ErrInvalidGroup
+	}
+	switch group.Category {
+	case NodeCategoryWaiting, NodeCategoryCDN, NodeCategoryTunnel:
+	default:
+		return ConfigSnapshot{}, NodeGroup{}, ErrInvalidGroup
+	}
+
+	now := time.Now().UTC()
+	if group.ID == "" {
+		group.ID = uuid.NewString()
+	}
+
+	ctx, cancel := e.withCtx(context.Background())
+	defer cancel()
+
+	existing, err := e.getNodeGroup(ctx, group.ID)
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		return ConfigSnapshot{}, NodeGroup{}, err
+	}
+	if existing.ID != "" {
+		group.CreatedAt = existing.CreatedAt
+		if existing.System && existing.Category != group.Category {
+			return ConfigSnapshot{}, NodeGroup{}, ErrProtectedGroup
+		}
+		if existing.System {
+			group.System = true
+		}
+		if group.Description == "" {
+			group.Description = existing.Description
+		}
+	} else if group.CreatedAt.IsZero() {
+		group.CreatedAt = now
+	}
+	if group.ID == defaultWaitingGroupID {
+		group.System = true
+		group.Category = NodeCategoryWaiting
+		if group.Name == "" {
+			group.Name = "待分组"
+		}
+	}
+	group.UpdatedAt = now
+
+	payload, err := json.Marshal(group)
+	if err != nil {
+		return ConfigSnapshot{}, NodeGroup{}, fmt.Errorf("marshal node group: %w", err)
+	}
+
+	if _, err = e.client.Put(ctx, e.nodeGroupKey(group.ID), string(payload)); err != nil {
+		return ConfigSnapshot{}, NodeGroup{}, fmt.Errorf("put node group: %w", err)
+	}
+
+	snap, err := e.Snapshot(context.Background())
+	if err != nil {
+		return ConfigSnapshot{}, NodeGroup{}, err
+	}
+	return snap, group, nil
+}
+
+// DeleteNodeGroup removes a node group and reassigns members to waiting pool.
+func (e *EtcdStore) DeleteNodeGroup(id string) (ConfigSnapshot, error) {
+	ctx, cancel := e.withCtx(context.Background())
+	defer cancel()
+
+	group, err := e.getNodeGroup(ctx, id)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return ConfigSnapshot{}, ErrGroupNotFound
+		}
+		return ConfigSnapshot{}, err
+	}
+	if group.System {
+		return ConfigSnapshot{}, ErrProtectedGroup
+	}
+
+	waitingGroup, err := e.ensureSystemGroup(NodeCategoryWaiting)
+	if err != nil {
+		return ConfigSnapshot{}, fmt.Errorf("ensure waiting group: %w", err)
+	}
+
+	nodesResp, err := e.client.Get(ctx, e.nodesPrefix(), clientv3.WithPrefix())
+	if err != nil {
+		return ConfigSnapshot{}, fmt.Errorf("list nodes: %w", err)
+	}
+
+	now := time.Now().UTC()
+	for _, kv := range nodesResp.Kvs {
+		var node EdgeNode
+		if err := json.Unmarshal(kv.Value, &node); err != nil {
+			return ConfigSnapshot{}, fmt.Errorf("decode node %s: %w", string(kv.Key), err)
+		}
+		if node.GroupID != id {
+			continue
+		}
+		node.GroupID = waitingGroup.ID
+		node.Category = waitingGroup.Category
+		node.UpdatedAt = now
+		payload, err := json.Marshal(node)
+		if err != nil {
+			return ConfigSnapshot{}, fmt.Errorf("marshal reassigned node: %w", err)
+		}
+		if _, err = e.client.Put(ctx, string(kv.Key), string(payload)); err != nil {
+			return ConfigSnapshot{}, fmt.Errorf("update node %s: %w", node.ID, err)
+		}
+	}
+
+	if _, err = e.client.Delete(ctx, e.nodeGroupKey(id)); err != nil {
+		return ConfigSnapshot{}, fmt.Errorf("delete node group: %w", err)
+	}
+
+	return e.Snapshot(context.Background())
+}
+
+// RegisterOrUpdateNode persists node metadata reported by agents.
+func (e *EtcdStore) RegisterOrUpdateNode(reg NodeRegistration) (ConfigSnapshot, EdgeNode, error) {
+	nodeID := strings.TrimSpace(reg.ID)
+	if nodeID == "" {
+		return ConfigSnapshot{}, EdgeNode{}, ErrNodeNotFound
+	}
+
+	ctx, cancel := e.withCtx(context.Background())
+	defer cancel()
+
+	var group NodeGroup
+	var err error
+	if id := strings.TrimSpace(reg.GroupID); id != "" {
+		group, err = e.getNodeGroup(ctx, id)
+		if err != nil {
+			if errors.Is(err, ErrNotFound) {
+				group, err = e.ensureSystemGroup(reg.Category)
+				if err != nil {
+					return ConfigSnapshot{}, EdgeNode{}, err
+				}
+			} else {
+				return ConfigSnapshot{}, EdgeNode{}, err
+			}
+		}
+	} else if reg.Category != "" {
+		group, err = e.ensureSystemGroup(reg.Category)
+		if err != nil {
+			return ConfigSnapshot{}, EdgeNode{}, err
+		}
+	} else {
+		group, err = e.ensureSystemGroup(NodeCategoryWaiting)
+		if err != nil {
+			return ConfigSnapshot{}, EdgeNode{}, err
+		}
+	}
+
+	existing, err := e.getNode(ctx, nodeID)
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		return ConfigSnapshot{}, EdgeNode{}, err
+	}
+
+	now := time.Now().UTC()
+	addresses := uniqueStrings(reg.Addresses)
+	if len(addresses) == 0 && strings.TrimSpace(reg.Hostname) == "" {
+		// keep addresses empty; hostname optional
+	}
+
+	node := existing
+	if node.ID == "" {
+		node.ID = nodeID
+		node.CreatedAt = now
+	}
+
+	node.GroupID = group.ID
+	node.Category = group.Category
+	if name := strings.TrimSpace(reg.Name); name != "" {
+		node.Name = name
+	}
+	if kind := strings.TrimSpace(reg.Kind); kind != "" {
+		node.Kind = kind
+	} else if node.Kind == "" {
+		node.Kind = "edge"
+	}
+
+	if host := strings.TrimSpace(reg.Hostname); host != "" {
+		node.Hostname = host
+	}
+	if len(addresses) > 0 {
+		node.Addresses = addresses
+	}
+	if ver := strings.TrimSpace(reg.Version); ver != "" {
+		node.Version = ver
+	}
+	node.LastSeen = now
+	node.UpdatedAt = now
+
+	payload, err := json.Marshal(node)
+	if err != nil {
+		return ConfigSnapshot{}, EdgeNode{}, fmt.Errorf("marshal node: %w", err)
+	}
+
+	if _, err = e.client.Put(ctx, e.nodeKey(node.ID), string(payload)); err != nil {
+		return ConfigSnapshot{}, EdgeNode{}, fmt.Errorf("put node: %w", err)
+	}
+
+	snap, err := e.Snapshot(context.Background())
+	if err != nil {
+		return ConfigSnapshot{}, EdgeNode{}, err
+	}
+	return snap, node, nil
+}
+
+// UpdateNodeGroup moves a node into another group.
+func (e *EtcdStore) UpdateNodeGroup(nodeID, groupID string) (ConfigSnapshot, EdgeNode, error) {
+	ctx, cancel := e.withCtx(context.Background())
+	defer cancel()
+
+	node, err := e.getNode(ctx, nodeID)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return ConfigSnapshot{}, EdgeNode{}, ErrNodeNotFound
+		}
+		return ConfigSnapshot{}, EdgeNode{}, err
+	}
+
+	targetID := strings.TrimSpace(groupID)
+	if targetID == "" {
+		targetID = defaultWaitingGroupID
+	}
+
+	group, err := e.getNodeGroup(ctx, targetID)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return ConfigSnapshot{}, EdgeNode{}, ErrGroupNotFound
+		}
+		return ConfigSnapshot{}, EdgeNode{}, err
+	}
+
+	node.GroupID = group.ID
+	node.Category = group.Category
+	node.UpdatedAt = time.Now().UTC()
+
+	payload, err := json.Marshal(node)
+	if err != nil {
+		return ConfigSnapshot{}, EdgeNode{}, fmt.Errorf("marshal node: %w", err)
+	}
+
+	if _, err = e.client.Put(ctx, e.nodeKey(node.ID), string(payload)); err != nil {
+		return ConfigSnapshot{}, EdgeNode{}, fmt.Errorf("put node: %w", err)
+	}
+
+	snap, err := e.Snapshot(context.Background())
+	if err != nil {
+		return ConfigSnapshot{}, EdgeNode{}, err
+	}
+	return snap, node, nil
+}
+
 // Snapshot reads all configuration entries from etcd.
 func (e *EtcdStore) Snapshot(ctx context.Context) (ConfigSnapshot, error) {
 	ctx, cancel := e.withCtx(ctx)
@@ -322,48 +590,62 @@ func (e *EtcdStore) Snapshot(ctx context.Context) (ConfigSnapshot, error) {
 	sslPolicies := make([]SSLPolicy, 0)
 	accessPolicies := make([]AccessPolicy, 0)
 	rewriteRules := make([]RewriteRule, 0)
+	nodeGroups := make([]NodeGroup, 0)
+	nodes := make([]EdgeNode, 0)
 
 	for _, kv := range resp.Kvs {
 		key := strings.TrimPrefix(string(kv.Key), e.prefix)
 		switch {
-	case strings.HasPrefix(key, domainsDir):
-		var route DomainRoute
-		if err := json.Unmarshal(kv.Value, &route); err != nil {
-			return ConfigSnapshot{}, fmt.Errorf("decode domain %s: %w", key, err)
+		case strings.HasPrefix(key, domainsDir):
+			var route DomainRoute
+			if err := json.Unmarshal(kv.Value, &route); err != nil {
+				return ConfigSnapshot{}, fmt.Errorf("decode domain %s: %w", key, err)
+			}
+			domains = append(domains, route)
+		case strings.HasPrefix(key, tunnelsDir):
+			var route TunnelRoute
+			if err := json.Unmarshal(kv.Value, &route); err != nil {
+				return ConfigSnapshot{}, fmt.Errorf("decode tunnel %s: %w", key, err)
+			}
+			tunnels = append(tunnels, route)
+		case strings.HasPrefix(key, certificatesDir):
+			var cert Certificate
+			if err := json.Unmarshal(kv.Value, &cert); err != nil {
+				return ConfigSnapshot{}, fmt.Errorf("decode certificate %s: %w", key, err)
+			}
+			certificates = append(certificates, cert)
+		case strings.HasPrefix(key, sslPoliciesDir):
+			var policy SSLPolicy
+			if err := json.Unmarshal(kv.Value, &policy); err != nil {
+				return ConfigSnapshot{}, fmt.Errorf("decode ssl policy %s: %w", key, err)
+			}
+			sslPolicies = append(sslPolicies, policy)
+		case strings.HasPrefix(key, accessPoliciesDir):
+			var policy AccessPolicy
+			if err := json.Unmarshal(kv.Value, &policy); err != nil {
+				return ConfigSnapshot{}, fmt.Errorf("decode access policy %s: %w", key, err)
+			}
+			accessPolicies = append(accessPolicies, policy)
+		case strings.HasPrefix(key, rewriteRulesDir):
+			var rule RewriteRule
+			if err := json.Unmarshal(kv.Value, &rule); err != nil {
+				return ConfigSnapshot{}, fmt.Errorf("decode rewrite rule %s: %w", key, err)
+			}
+			rewriteRules = append(rewriteRules, rule)
+		case strings.HasPrefix(key, nodeGroupsDir):
+			var group NodeGroup
+			if err := json.Unmarshal(kv.Value, &group); err != nil {
+				return ConfigSnapshot{}, fmt.Errorf("decode node group %s: %w", key, err)
+			}
+			nodeGroups = append(nodeGroups, group)
+		case strings.HasPrefix(key, nodesDir):
+			var node EdgeNode
+			if err := json.Unmarshal(kv.Value, &node); err != nil {
+				return ConfigSnapshot{}, fmt.Errorf("decode node %s: %w", key, err)
+			}
+			nodes = append(nodes, node)
 		}
-		domains = append(domains, route)
-	case strings.HasPrefix(key, tunnelsDir):
-		var route TunnelRoute
-		if err := json.Unmarshal(kv.Value, &route); err != nil {
-			return ConfigSnapshot{}, fmt.Errorf("decode tunnel %s: %w", key, err)
-		}
-		tunnels = append(tunnels, route)
-	case strings.HasPrefix(key, certificatesDir):
-		var cert Certificate
-		if err := json.Unmarshal(kv.Value, &cert); err != nil {
-			return ConfigSnapshot{}, fmt.Errorf("decode certificate %s: %w", key, err)
-		}
-		certificates = append(certificates, cert)
-	case strings.HasPrefix(key, sslPoliciesDir):
-		var policy SSLPolicy
-		if err := json.Unmarshal(kv.Value, &policy); err != nil {
-			return ConfigSnapshot{}, fmt.Errorf("decode ssl policy %s: %w", key, err)
-		}
-		sslPolicies = append(sslPolicies, policy)
-	case strings.HasPrefix(key, accessPoliciesDir):
-		var policy AccessPolicy
-		if err := json.Unmarshal(kv.Value, &policy); err != nil {
-			return ConfigSnapshot{}, fmt.Errorf("decode access policy %s: %w", key, err)
-		}
-		accessPolicies = append(accessPolicies, policy)
-	case strings.HasPrefix(key, rewriteRulesDir):
-		var rule RewriteRule
-		if err := json.Unmarshal(kv.Value, &rule); err != nil {
-			return ConfigSnapshot{}, fmt.Errorf("decode rewrite rule %s: %w", key, err)
-		}
-		rewriteRules = append(rewriteRules, rule)
 	}
-}
 
 	sort.Slice(domains, func(i, j int) bool {
 		if domains[i].Domain == domains[j].Domain {
@@ -413,15 +695,31 @@ func (e *EtcdStore) Snapshot(ctx context.Context) (ConfigSnapshot, error) {
 		return rewriteRules[i].Priority < rewriteRules[j].Priority
 	})
 
+	sort.Slice(nodeGroups, func(i, j int) bool {
+		if nodeGroups[i].Category == nodeGroups[j].Category {
+			if nodeGroups[i].Name == nodeGroups[j].Name {
+				return nodeGroups[i].ID < nodeGroups[j].ID
+			}
+			return nodeGroups[i].Name < nodeGroups[j].Name
+		}
+		return nodeGroups[i].Category < nodeGroups[j].Category
+	})
+
+	sort.Slice(nodes, func(i, j int) bool {
+		return nodes[i].ID < nodes[j].ID
+	})
+
 	return ConfigSnapshot{
-		Version:     resp.Header.Revision,
-		GeneratedAt: time.Now().UTC(),
-		Domains:     domains,
-		Tunnels:     tunnels,
-		Certificates: certificates,
-		SSLPolicies:  sslPolicies,
+		Version:        resp.Header.Revision,
+		GeneratedAt:    time.Now().UTC(),
+		Domains:        domains,
+		Tunnels:        tunnels,
+		Certificates:   certificates,
+		SSLPolicies:    sslPolicies,
 		AccessPolicies: accessPolicies,
-		RewriteRules:  rewriteRules,
+		RewriteRules:   rewriteRules,
+		NodeGroups:     nodeGroups,
+		Nodes:          nodes,
 	}, nil
 }
 
@@ -494,9 +792,87 @@ func (e *EtcdStore) rewriteRuleKey(id string) string {
 	return e.prefix + rewriteRulesDir + id
 }
 
+func (e *EtcdStore) nodeGroupKey(id string) string {
+	return e.prefix + nodeGroupsDir + id
+}
+
+func (e *EtcdStore) nodeKey(id string) string {
+	return e.prefix + nodesDir + id
+}
+
+func (e *EtcdStore) nodeGroupsPrefix() string {
+	return e.prefix + nodeGroupsDir
+}
+
+func (e *EtcdStore) nodesPrefix() string {
+	return e.prefix + nodesDir
+}
+
 func (e *EtcdStore) withCtx(parent context.Context) (context.Context, context.CancelFunc) {
 	if parent == nil {
 		return context.WithTimeout(context.Background(), e.timeout)
 	}
 	return context.WithTimeout(parent, e.timeout)
+}
+
+func (e *EtcdStore) ensureSystemGroup(category NodeCategory) (NodeGroup, error) {
+	ctx, cancel := e.withCtx(context.Background())
+	defer cancel()
+
+	id, name := defaultSystemGroupMeta(category)
+	group, err := e.getNodeGroup(ctx, id)
+	if err == nil {
+		return group, nil
+	}
+	if !errors.Is(err, ErrNotFound) {
+		return NodeGroup{}, err
+	}
+
+	now := time.Now().UTC()
+	group = NodeGroup{
+		ID:        id,
+		Name:      name,
+		Category:  category,
+		System:    true,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	payload, err := json.Marshal(group)
+	if err != nil {
+		return NodeGroup{}, fmt.Errorf("marshal system node group: %w", err)
+	}
+	if _, err = e.client.Put(ctx, e.nodeGroupKey(group.ID), string(payload)); err != nil {
+		return NodeGroup{}, fmt.Errorf("put system node group: %w", err)
+	}
+	return group, nil
+}
+
+func (e *EtcdStore) getNodeGroup(ctx context.Context, id string) (NodeGroup, error) {
+	resp, err := e.client.Get(ctx, e.nodeGroupKey(id))
+	if err != nil {
+		return NodeGroup{}, fmt.Errorf("get node group: %w", err)
+	}
+	if len(resp.Kvs) == 0 {
+		return NodeGroup{}, ErrNotFound
+	}
+	var group NodeGroup
+	if err := json.Unmarshal(resp.Kvs[0].Value, &group); err != nil {
+		return NodeGroup{}, fmt.Errorf("decode node group: %w", err)
+	}
+	return group, nil
+}
+
+func (e *EtcdStore) getNode(ctx context.Context, id string) (EdgeNode, error) {
+	resp, err := e.client.Get(ctx, e.nodeKey(id))
+	if err != nil {
+		return EdgeNode{}, fmt.Errorf("get node: %w", err)
+	}
+	if len(resp.Kvs) == 0 {
+		return EdgeNode{}, ErrNotFound
+	}
+	var node EdgeNode
+	if err := json.Unmarshal(resp.Kvs[0].Value, &node); err != nil {
+		return EdgeNode{}, fmt.Errorf("decode node: %w", err)
+	}
+	return node, nil
 }

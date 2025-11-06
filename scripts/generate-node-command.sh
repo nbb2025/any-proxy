@@ -24,14 +24,26 @@ else
   }
 fi
 
+generate_node_id() {
+  if command -v uuidgen >/dev/null 2>&1; then
+    printf "node-%s" "$(uuidgen | tr 'A-Z' 'a-z')"
+  else
+    printf "node-%s-%s" "$(date +%s)" "$RANDOM"
+  fi
+}
+
 CONTROL_PLANE_URL="${CONTROL_PLANE_URL:-https://anyproxy.weekeasy.com}"
 NODE_TYPE=""
 NODE_ID=""
+NODE_NAME="${ANYPROXY_NODE_NAME:-}"
+NODE_GROUP="${ANYPROXY_NODE_GROUP_ID:-}"
+NODE_CATEGORY="${ANYPROXY_NODE_CATEGORY:-}"
 TTL_MINUTES=30
 TOKENS_DIR="${ANYPROXY_TOKENS_DIR:-/opt/anyproxy/install/tokens}"
 VERSION="${ANYPROXY_VERSION:-latest}"
 RELOAD_CMD="${ANYPROXY_RELOAD_CMD:-}"
 OUTPUT_PATH="${ANYPROXY_OUTPUT_PATH:-}"
+STREAM_OUTPUT_PATH="${ANYPROXY_STREAM_OUTPUT_PATH:-}"
 OUTPUT_FORMAT="${ANYPROXY_OUTPUT_FMT:-text}"
 AGENT_TOKEN="${ANYPROXY_AGENT_TOKEN:-}"
 CERT_DIR="${ANYPROXY_CERT_DIR:-}"
@@ -39,7 +51,7 @@ CLIENT_CA_DIR="${ANYPROXY_CLIENT_CA_DIR:-}"
 
 usage() {
   cat <<'EOF'
-Usage: generate-node-command.sh --type edge|tunnel --node NODE_ID [options]
+Usage: generate-node-command.sh --type edge|tunnel [--node NODE_ID] [options]
 
 Options:
   --control-plane URL   Base URL where agent.sh/token is hosted (default: env CONTROL_PLANE_URL or https://anyproxy.weekeasy.com)
@@ -48,6 +60,10 @@ Options:
   --version VERSION     Agent version tag (default: env ANYPROXY_VERSION or "latest")
   --reload CMD          Override reload command passed to installer (default: env ANYPROXY_RELOAD_CMD)
   --output PATH         Override agent --output path passed to installer
+  --stream-output PATH  Override stream config output path (edge installs only; default stream.d)
+  --node-name NAME      Optional friendly display name for the node
+  --node-group ID       Optional node group identifier to apply on registration
+  --node-category KIND  Optional category hint (cdn|tunnel)
   --cert-dir PATH       Override agent certificate directory (default: env ANYPROXY_CERT_DIR)
   --client-ca-dir PATH  Override agent client CA directory (default: env ANYPROXY_CLIENT_CA_DIR or cert dir)
   --agent-token TOKEN   Embed control-plane bearer token for agents (default: env ANYPROXY_AGENT_TOKEN)
@@ -58,11 +74,15 @@ Environment:
   ANYPROXY_TOKENS_DIR   Storage directory for generated token files
   ANYPROXY_VERSION      Default agent version
   ANYPROXY_RELOAD_CMD   Default reload command
-  ANYPROXY_OUTPUT_PATH  Default output path override
+  ANYPROXY_OUTPUT_PATH  Default HTTP output path override
+  ANYPROXY_STREAM_OUTPUT_PATH Default stream output path override
   ANYPROXY_OUTPUT_FMT   Default format (text/env)
   ANYPROXY_CERT_DIR      Default certificate directory
   ANYPROXY_CLIENT_CA_DIR Default client CA directory
   ANYPROXY_AGENT_TOKEN   Default agent bearer token
+  ANYPROXY_NODE_NAME     Default node display name
+  ANYPROXY_NODE_GROUP_ID Default node group identifier
+  ANYPROXY_NODE_CATEGORY Default node category hint
 EOF
   exit 1
 }
@@ -105,6 +125,22 @@ while [[ $# -gt 0 ]]; do
       OUTPUT_PATH=${2:-}
       shift 2
       ;;
+    --stream-output)
+      STREAM_OUTPUT_PATH=${2:-}
+      shift 2
+      ;;
+    --node-name)
+      NODE_NAME=${2:-}
+      shift 2
+      ;;
+    --node-group)
+      NODE_GROUP=${2:-}
+      shift 2
+      ;;
+    --node-category)
+      NODE_CATEGORY=${2:-}
+      shift 2
+      ;;
     --cert-dir)
       CERT_DIR=${2:-}
       shift 2
@@ -127,8 +163,8 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ -z $NODE_TYPE || -z $NODE_ID ]]; then
-  echo "[anyproxy-token] --type and --node are required" >&2
+if [[ -z $NODE_TYPE ]]; then
+  echo "[anyproxy-token] --type is required" >&2
   usage
 fi
 
@@ -136,6 +172,19 @@ if [[ "$NODE_TYPE" != "edge" && "$NODE_TYPE" != "tunnel" ]]; then
   echo "[anyproxy-token] --type must be edge or tunnel" >&2
   exit 1
 fi
+
+if [[ -z $NODE_ID ]]; then
+  NODE_ID=$(generate_node_id)
+  echo "[anyproxy-token] auto-generated node id: ${NODE_ID}"
+fi
+
+NODE_CATEGORY=$(echo "${NODE_CATEGORY,,}")
+case "$NODE_CATEGORY" in
+  cdn|tunnel|"") ;;
+  *)
+    NODE_CATEGORY=""
+    ;;
+esac
 
 case "$OUTPUT_FORMAT" in
   text|env) ;;
@@ -179,6 +228,18 @@ fi
 if [[ -n $OUTPUT_PATH ]]; then
   CMD+=" ANYPROXY_OUTPUT_PATH=$(escape "${OUTPUT_PATH}")"
 fi
+if [[ -n $STREAM_OUTPUT_PATH ]]; then
+  CMD+=" ANYPROXY_STREAM_OUTPUT_PATH=$(escape "${STREAM_OUTPUT_PATH}")"
+fi
+if [[ -n $NODE_NAME ]]; then
+  CMD+=" ANYPROXY_NODE_NAME=$(escape "${NODE_NAME}")"
+fi
+if [[ -n $NODE_GROUP ]]; then
+  CMD+=" ANYPROXY_NODE_GROUP_ID=$(escape "${NODE_GROUP}")"
+fi
+if [[ -n $NODE_CATEGORY ]]; then
+  CMD+=" ANYPROXY_NODE_CATEGORY=$(escape "${NODE_CATEGORY}")"
+fi
 if [[ -n $CERT_DIR ]]; then
   CMD+=" ANYPROXY_CERT_DIR=$(escape "${CERT_DIR}")"
 fi
@@ -204,6 +265,10 @@ if [[ "$OUTPUT_FORMAT" == "env" ]]; then
     printf 'VERSION=%s\n' "$VERSION"
     printf 'RELOAD_CMD=%s\n' "$RELOAD_CMD"
     printf 'OUTPUT_PATH=%s\n' "$OUTPUT_PATH"
+    printf 'STREAM_OUTPUT_PATH=%s\n' "$STREAM_OUTPUT_PATH"
+    printf 'NODE_NAME=%s\n' "$NODE_NAME"
+    printf 'NODE_GROUP_ID=%s\n' "$NODE_GROUP"
+    printf 'NODE_CATEGORY=%s\n' "$NODE_CATEGORY"
     printf 'CERT_DIR=%s\n' "$CERT_DIR"
     printf 'CLIENT_CA_DIR=%s\n' "$CLIENT_CA_DIR"
     printf 'AGENT_TOKEN=%s\n' "$AGENT_TOKEN"
@@ -213,7 +278,17 @@ fi
 
 echo "[anyproxy-token] token written to ${TOKEN_PATH}"
 echo
-echo "在目标 ${NODE_TYPE} 节点执行以下命令："
+if [[ "$NODE_TYPE" == "edge" ]]; then
+  echo "在目标边缘节点执行以下命令（将同步部署 HTTP + 隧道 Agent）："
+else
+  echo "在目标 ${NODE_TYPE} 节点执行以下命令："
+fi
+if [[ -n $NODE_NAME ]]; then
+  echo "[anyproxy-token] 节点名称：${NODE_NAME}"
+fi
+if [[ -n $NODE_CATEGORY ]]; then
+  echo "[anyproxy-token] 节点用途：${NODE_CATEGORY}"
+fi
 echo
 echo "$CMD"
 echo

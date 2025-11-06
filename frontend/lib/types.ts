@@ -148,6 +148,31 @@ export interface RewriteRule {
   updatedAt?: string
 }
 
+export type NodeCategory = "waiting" | "cdn" | "tunnel"
+
+export interface NodeGroup {
+  id: string
+  name: string
+  category: NodeCategory
+  description?: string
+  system?: boolean
+  createdAt?: string
+  updatedAt?: string
+}
+
+export interface EdgeNode {
+  id: string
+  groupId: string
+  category: NodeCategory
+  kind: string
+  hostname?: string
+  addresses: string[]
+  version?: string
+  lastSeen?: string
+  createdAt?: string
+  updatedAt?: string
+}
+
 export interface ConfigSnapshot {
   version: number
   generatedAt: string

@@ -3,6 +3,7 @@ import { execFile } from "node:child_process"
 import { promisify } from "node:util"
 import path from "node:path"
 import { existsSync } from "node:fs"
+import { randomUUID } from "node:crypto"
 import { getControlPlaneURL } from "@/lib/control-plane.server"
 
 const execFileAsync = promisify(execFile)
@@ -10,11 +11,15 @@ const execFileAsync = promisify(execFile)
 type GenerateRequest = {
   nodeType?: string
   nodeId?: string
+  nodeName?: string
+  nodeCategory?: string
+  groupId?: string
   ttlMinutes?: number
   version?: string
   controlPlaneUrl?: string
   reloadCmd?: string
   outputPath?: string
+  streamOutputPath?: string
   agentToken?: string
 }
 
@@ -45,19 +50,22 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "invalid JSON payload" }, { status: 400 })
   }
 
-  const nodeType = (payload.nodeType ?? "edge").toLowerCase()
+  const requestedType = payload.nodeType ? payload.nodeType.trim().toLowerCase() : undefined
+  const nodeType = requestedType === "tunnel" ? "tunnel" : "edge"
   const nodeId = payload.nodeId?.trim()
+  const nodeName = payload.nodeName?.trim()
+  const nodeCategory = payload.nodeCategory?.trim()
+  const groupId = payload.groupId?.trim()
   const version = payload.version?.trim()
   const reloadCmd = payload.reloadCmd?.trim()
   const outputPath = payload.outputPath?.trim()
+  const streamOutputPath = payload.streamOutputPath?.trim()
   const agentToken = payload.agentToken?.trim()
   const ttlCandidate = Number.parseInt(String(payload.ttlMinutes ?? 30), 10)
   const ttlMinutes = Number.isFinite(ttlCandidate) ? Math.max(5, Math.min(ttlCandidate, 720)) : 30
 
-  if (!nodeId) {
-    return NextResponse.json({ error: "nodeId is required" }, { status: 400 })
-  }
-  if (nodeType !== "edge" && nodeType !== "tunnel") {
+  const resolvedNodeId = nodeId && nodeId.length > 0 ? nodeId : `node-${randomUUID()}`
+  if (requestedType && requestedType !== "edge" && requestedType !== "tunnel") {
     return NextResponse.json({ error: "nodeType must be edge or tunnel" }, { status: 400 })
   }
 
@@ -84,7 +92,7 @@ export async function POST(request: Request) {
     getControlPlaneURL() ??
     ""
 
-  const args = ["--type", nodeType, "--node", nodeId, "--format", "env", "--ttl-min", String(ttlMinutes)]
+  const args = ["--type", nodeType, "--node", resolvedNodeId, "--format", "env", "--ttl-min", String(ttlMinutes)]
   if (version) {
     args.push("--version", version)
   }
@@ -93,6 +101,18 @@ export async function POST(request: Request) {
   }
   if (outputPath) {
     args.push("--output", outputPath)
+  }
+  if (streamOutputPath) {
+    args.push("--stream-output", streamOutputPath)
+  }
+  if (nodeName) {
+    args.push("--node-name", nodeName)
+  }
+  if (groupId) {
+    args.push("--node-group", groupId)
+  }
+  if (nodeCategory) {
+    args.push("--node-category", nodeCategory)
   }
   if (controlPlaneUrl) {
     args.push("--control-plane", controlPlaneUrl)
@@ -118,6 +138,15 @@ export async function POST(request: Request) {
   if (agentToken) {
     execEnv.ANYPROXY_AGENT_TOKEN = agentToken
   }
+  if (nodeName) {
+    execEnv.ANYPROXY_NODE_NAME = nodeName
+  }
+  if (groupId) {
+    execEnv.ANYPROXY_NODE_GROUP_ID = groupId
+  }
+  if (nodeCategory) {
+    execEnv.ANYPROXY_NODE_CATEGORY = nodeCategory
+  }
 
   try {
     const { stdout } = await execFileAsync(scriptPath, args, {
@@ -136,6 +165,10 @@ export async function POST(request: Request) {
     const expiresAt = Number.parseInt(data.EXPIRES_AT ?? "", 10)
     const expiresAtIso = data.EXPIRES_AT_ISO ?? null
 
+    const resolvedNodeName = (data.NODE_NAME ?? nodeName ?? "").trim()
+    const resolvedNodeCategory = (data.NODE_CATEGORY ?? nodeCategory ?? "").trim()
+    const resolvedGroupId = (data.NODE_GROUP_ID ?? groupId ?? "").trim()
+
     return NextResponse.json({
       command,
       token: data.TOKEN,
@@ -144,10 +177,14 @@ export async function POST(request: Request) {
       expiresAtIso,
       controlPlaneUrl: data.CONTROL_PLANE_URL ?? controlPlaneUrl,
       nodeType: data.NODE_TYPE ?? nodeType,
-      nodeId: data.NODE_ID ?? nodeId,
+      nodeId: data.NODE_ID ?? resolvedNodeId,
+      nodeName: resolvedNodeName.length > 0 ? resolvedNodeName : null,
+      nodeCategory: resolvedNodeCategory.length > 0 ? resolvedNodeCategory : null,
+      groupId: resolvedGroupId.length > 0 ? resolvedGroupId : null,
       version: data.VERSION ?? version ?? null,
       reloadCmd: data.RELOAD_CMD ?? reloadCmd ?? null,
       outputPath: data.OUTPUT_PATH ?? outputPath ?? null,
+      streamOutputPath: data.STREAM_OUTPUT_PATH ?? streamOutputPath ?? null,
       agentToken: data.AGENT_TOKEN ?? agentToken ?? null,
       ttlMinutes,
     })
