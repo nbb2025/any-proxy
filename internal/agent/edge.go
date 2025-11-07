@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"anyproxy.dev/any-proxy/internal/configstore"
+	tserver "anyproxy.dev/any-proxy/internal/tunnel/server"
 	"anyproxy.dev/any-proxy/pkg/templates"
 )
 
@@ -55,6 +56,7 @@ type EdgeAgent struct {
 	nodeName     string
 	nodeCategory string
 	lastReg      time.Time
+	tunnelMgr    *tunnelServerManager
 }
 
 const edgeRegisterInterval = time.Minute
@@ -130,6 +132,7 @@ func NewEdgeAgent(opts EdgeOptions) (*EdgeAgent, error) {
 		groupID:      strings.TrimSpace(opts.GroupID),
 		nodeName:     strings.TrimSpace(opts.NodeName),
 		nodeCategory: category,
+		tunnelMgr:    newTunnelServerManager(logger),
 	}, nil
 }
 
@@ -141,6 +144,7 @@ func (a *EdgeAgent) Run(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			a.logger.Printf("[edge] context closed, stopping: %v", ctx.Err())
+			a.tunnelMgr.Stop()
 			return ctx.Err()
 		default:
 		}
@@ -246,6 +250,11 @@ func (a *EdgeAgent) applySnapshot(ctx context.Context, snap configstore.ConfigSn
 			return fmt.Errorf("render haproxy template: %w", err)
 		}
 		haproxyChanged = changed
+	}
+
+	tunnelPlan := planTunnelServers(snap, a.opts.NodeID)
+	if err := a.tunnelMgr.Update(ctx, tunnelPlan); err != nil {
+		a.logger.Printf("[edge] tunnel server update error: %v", err)
 	}
 
 	if a.opts.DryRun {
@@ -510,6 +519,51 @@ func transformHAProxySnapshot(snap configstore.ConfigSnapshot, nodeID string) te
 		})
 	}
 	return data
+}
+
+func planTunnelServers(snap configstore.ConfigSnapshot, nodeID string) map[string]map[string]tserver.SessionInfo {
+	plan := make(map[string]map[string]tserver.SessionInfo)
+	if nodeID == "" {
+		return plan
+	}
+	for _, group := range snap.TunnelGroups {
+		if !containsString(group.EdgeNodeIDs, nodeID) {
+			continue
+		}
+		addr := strings.TrimSpace(group.ListenAddress)
+		if addr == "" {
+			addr = ":4433"
+		}
+		keyMap := plan[addr]
+		if keyMap == nil {
+			keyMap = make(map[string]tserver.SessionInfo)
+			plan[addr] = keyMap
+		}
+		for _, agent := range snap.TunnelAgents {
+			if agent.GroupID != group.ID || !agent.Enabled {
+				continue
+			}
+			hash := strings.TrimSpace(agent.KeyHash)
+			if hash == "" {
+				continue
+			}
+			keyMap[hash] = tserver.SessionInfo{
+				AgentID: agent.ID,
+				NodeID:  agent.NodeID,
+				GroupID: agent.GroupID,
+			}
+		}
+	}
+	return plan
+}
+
+func containsString(list []string, needle string) bool {
+	for _, v := range list {
+		if v == needle {
+			return true
+		}
+	}
+	return false
 }
 
 func routeAssigned(assignments []string, nodeID string) bool {

@@ -15,3 +15,5 @@ configs/generated/
 deploy/*.crt
 deploy/*.key
 .gocache/
+install/binaries/
+deploy/etcd-data/
