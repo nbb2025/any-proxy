@@ -189,3 +189,21 @@ type TunnelRoute struct {
 	TargetAddress    string
 	EnableProxyProto bool
 }
+
+// HAProxyTemplateData renders HAProxy frontends/backends for TCP/UDP routes.
+type HAProxyTemplateData struct {
+	Version     int64
+	GeneratedAt time.Time
+	NodeID      string
+	Routes      []HAProxyRoute
+}
+
+// HAProxyRoute describes a single frontend/backend pair.
+type HAProxyRoute struct {
+	Name                string
+	Mode                string
+	BindAddress         string
+	TargetAddress       string
+	IdleTimeout         string
+	EnableProxyProtocol bool
+}

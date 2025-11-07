@@ -2,7 +2,12 @@ package configstore
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"sort"
 	"strings"
 	"sync"
@@ -31,6 +36,10 @@ type Store interface {
 	DeleteNodeGroup(id string) (ConfigSnapshot, error)
 	RegisterOrUpdateNode(reg NodeRegistration) (ConfigSnapshot, EdgeNode, error)
 	UpdateNodeGroup(nodeID, groupID string) (ConfigSnapshot, EdgeNode, error)
+	UpsertTunnelGroup(group TunnelGroup) (ConfigSnapshot, TunnelGroup, error)
+	DeleteTunnelGroup(id string) (ConfigSnapshot, error)
+	UpsertTunnelAgent(agent TunnelAgent) (ConfigSnapshot, TunnelAgent, error)
+	DeleteTunnelAgent(id string) (ConfigSnapshot, error)
 }
 
 // DomainRoute represents a domain level forwarding rule that an edge node should proxy.
@@ -79,6 +88,44 @@ type TunnelRoute struct {
 type TunnelMeta struct {
 	EnableProxyProtocol bool   `json:"enableProxyProtocol,omitempty"`
 	Description         string `json:"description,omitempty"`
+}
+
+// TunnelGroup represents a logical ingress shared by tunnel agents and edge nodes.
+type TunnelGroup struct {
+	ID             string    `json:"id"`
+	Name           string    `json:"name"`
+	Description    string    `json:"description,omitempty"`
+	ListenAddress  string    `json:"listenAddress"`
+	EdgeNodeIDs    []string  `json:"edgeNodeIds,omitempty"`
+	Transports     []string  `json:"transports,omitempty"`
+	EnableCompress bool      `json:"enableCompress,omitempty"`
+	CreatedAt      time.Time `json:"createdAt"`
+	UpdatedAt      time.Time `json:"updatedAt"`
+}
+
+// TunnelAgentService declares a local service that can be exposed via tunnel.
+type TunnelAgentService struct {
+	ID                string `json:"id"`
+	Protocol          string `json:"protocol"`
+	LocalAddress      string `json:"localAddress"`
+	LocalPort         int    `json:"localPort"`
+	RemotePort        int    `json:"remotePort"`
+	EnableCompression bool   `json:"enableCompression,omitempty"`
+	Description       string `json:"description,omitempty"`
+}
+
+// TunnelAgent describes a tunnel client instance living inside a private network.
+type TunnelAgent struct {
+	ID          string               `json:"id"`
+	NodeID      string               `json:"nodeId"`
+	GroupID     string               `json:"groupId"`
+	Description string               `json:"description,omitempty"`
+	KeyHash     string               `json:"keyHash"`
+	KeyVersion  int                  `json:"keyVersion"`
+	Enabled     bool                 `json:"enabled"`
+	Services    []TunnelAgentService `json:"services,omitempty"`
+	CreatedAt   time.Time            `json:"createdAt"`
+	UpdatedAt   time.Time            `json:"updatedAt"`
 }
 
 // Certificate represents TLS material managed by the control plane.
@@ -262,6 +309,8 @@ type ConfigSnapshot struct {
 	GeneratedAt    time.Time      `json:"generatedAt"`
 	Domains        []DomainRoute  `json:"domains"`
 	Tunnels        []TunnelRoute  `json:"tunnels"`
+	TunnelGroups   []TunnelGroup  `json:"tunnelGroups"`
+	TunnelAgents   []TunnelAgent  `json:"tunnelAgents"`
 	Certificates   []Certificate  `json:"certificates"`
 	SSLPolicies    []SSLPolicy    `json:"sslPolicies"`
 	AccessPolicies []AccessPolicy `json:"accessPolicies"`
@@ -275,6 +324,8 @@ type MemoryStore struct {
 	version        int64
 	domains        map[string]DomainRoute
 	tunnels        map[string]TunnelRoute
+	tunnelGroups   map[string]TunnelGroup
+	tunnelAgents   map[string]TunnelAgent
 	certificates   map[string]Certificate
 	sslPolicies    map[string]SSLPolicy
 	accessPolicies map[string]AccessPolicy
@@ -296,6 +347,16 @@ var (
 	ErrNodeNotFound = errors.New("configstore: node not found")
 	// ErrProtectedGroup indicates a system group cannot be modified.
 	ErrProtectedGroup = errors.New("configstore: protected node group")
+	// ErrTunnelGroupNotFound indicates a tunnel group is missing.
+	ErrTunnelGroupNotFound = errors.New("configstore: tunnel group not found")
+	// ErrTunnelAgentNotFound indicates a tunnel agent is missing.
+	ErrTunnelAgentNotFound = errors.New("configstore: tunnel agent not found")
+	// ErrInvalidTunnelGroup indicates the supplied tunnel group definition is invalid.
+	ErrInvalidTunnelGroup = errors.New("configstore: invalid tunnel group")
+	// ErrInvalidTunnelAgent indicates the supplied tunnel agent definition is invalid.
+	ErrInvalidTunnelAgent = errors.New("configstore: invalid tunnel agent")
+	// ErrTunnelGroupInUse indicates the group cannot be removed due to active agents.
+	ErrTunnelGroupInUse = errors.New("configstore: tunnel group in use")
 )
 
 // NewMemoryStore returns an initialised MemoryStore.
@@ -303,6 +364,8 @@ func NewMemoryStore() *MemoryStore {
 	store := &MemoryStore{
 		domains:        make(map[string]DomainRoute),
 		tunnels:        make(map[string]TunnelRoute),
+		tunnelGroups:   make(map[string]TunnelGroup),
+		tunnelAgents:   make(map[string]TunnelAgent),
 		certificates:   make(map[string]Certificate),
 		sslPolicies:    make(map[string]SSLPolicy),
 		accessPolicies: make(map[string]AccessPolicy),
@@ -731,6 +794,112 @@ func (s *MemoryStore) UpdateNodeGroup(nodeID, groupID string) (ConfigSnapshot, E
 	return s.snapshotLocked(), node, nil
 }
 
+// UpsertTunnelGroup creates or updates a tunnel ingress group.
+func (s *MemoryStore) UpsertTunnelGroup(group TunnelGroup) (ConfigSnapshot, TunnelGroup, error) {
+	if strings.TrimSpace(group.Name) == "" {
+		return ConfigSnapshot{}, TunnelGroup{}, ErrInvalidTunnelGroup
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if group.ID == "" {
+		group.ID = uuid.NewString()
+	}
+	now := time.Now().UTC()
+	if existing, ok := s.tunnelGroups[group.ID]; ok {
+		if group.CreatedAt.IsZero() {
+			group.CreatedAt = existing.CreatedAt
+		}
+	} else if group.CreatedAt.IsZero() {
+		group.CreatedAt = now
+	}
+	group.ListenAddress = strings.TrimSpace(group.ListenAddress)
+	if group.ListenAddress == "" {
+		group.ListenAddress = ":4433"
+	}
+	group.EdgeNodeIDs = dedupeStrings(group.EdgeNodeIDs)
+	group.Transports = normalizeTransports(group.Transports)
+	group.UpdatedAt = now
+	s.tunnelGroups[group.ID] = group
+	s.bumpLocked()
+	return s.snapshotLocked(), group, nil
+}
+
+// DeleteTunnelGroup removes the specified tunnel group.
+func (s *MemoryStore) DeleteTunnelGroup(id string) (ConfigSnapshot, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.tunnelGroups[id]; !ok {
+		return ConfigSnapshot{}, ErrTunnelGroupNotFound
+	}
+	for _, agent := range s.tunnelAgents {
+		if agent.GroupID == id {
+			return ConfigSnapshot{}, ErrTunnelGroupInUse
+		}
+	}
+	delete(s.tunnelGroups, id)
+	s.bumpLocked()
+	return s.snapshotLocked(), nil
+}
+
+// UpsertTunnelAgent creates or updates a tunnel client definition.
+func (s *MemoryStore) UpsertTunnelAgent(agent TunnelAgent) (ConfigSnapshot, TunnelAgent, error) {
+	agent.NodeID = strings.TrimSpace(agent.NodeID)
+	agent.GroupID = strings.TrimSpace(agent.GroupID)
+	agent.KeyHash = strings.TrimSpace(agent.KeyHash)
+	if agent.NodeID == "" || agent.GroupID == "" || agent.KeyHash == "" {
+		return ConfigSnapshot{}, TunnelAgent{}, ErrInvalidTunnelAgent
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.tunnelGroups[agent.GroupID]; !ok {
+		return ConfigSnapshot{}, TunnelAgent{}, ErrTunnelGroupNotFound
+	}
+	if agent.ID == "" {
+		agent.ID = uuid.NewString()
+	}
+	now := time.Now().UTC()
+	if existing, ok := s.tunnelAgents[agent.ID]; ok {
+		if agent.CreatedAt.IsZero() {
+			agent.CreatedAt = existing.CreatedAt
+		}
+		if agent.KeyVersion == 0 {
+			agent.KeyVersion = existing.KeyVersion
+		}
+		if agent.KeyHash == "" {
+			agent.KeyHash = existing.KeyHash
+		}
+	} else {
+		if agent.CreatedAt.IsZero() {
+			agent.CreatedAt = now
+		}
+		if agent.KeyVersion == 0 {
+			agent.KeyVersion = 1
+		}
+	}
+	agent.Services = normalizeServices(agent.Services)
+	agent.UpdatedAt = now
+	s.tunnelAgents[agent.ID] = agent
+	s.bumpLocked()
+	return s.snapshotLocked(), agent, nil
+}
+
+// DeleteTunnelAgent removes a tunnel agent definition.
+func (s *MemoryStore) DeleteTunnelAgent(id string) (ConfigSnapshot, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.tunnelAgents[id]; !ok {
+		return ConfigSnapshot{}, ErrTunnelAgentNotFound
+	}
+	delete(s.tunnelAgents, id)
+	s.bumpLocked()
+	return s.snapshotLocked(), nil
+}
+
 func uniqueStrings(values []string) []string {
 	result := make([]string, 0, len(values))
 	seen := make(map[string]struct{}, len(values))
@@ -827,6 +996,92 @@ func (s *MemoryStore) bumpLocked() {
 	}
 }
 
+func dedupeStrings(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+	for _, v := range values {
+		v = strings.TrimSpace(v)
+		if v == "" {
+			continue
+		}
+		if _, ok := seen[v]; ok {
+			continue
+		}
+		seen[v] = struct{}{}
+		out = append(out, v)
+	}
+	return out
+}
+
+func normalizeTransports(values []string) []string {
+	if len(values) == 0 {
+		return []string{"quic"}
+	}
+	seen := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+	for _, v := range values {
+		v = strings.ToLower(strings.TrimSpace(v))
+		if v == "" {
+			continue
+		}
+		switch v {
+		case "quic", "websocket":
+		default:
+			continue
+		}
+		if _, ok := seen[v]; ok {
+			continue
+		}
+		seen[v] = struct{}{}
+		out = append(out, v)
+	}
+	return out
+}
+
+func normalizeServices(services []TunnelAgentService) []TunnelAgentService {
+	seen := make(map[string]struct{}, len(services))
+	for i := range services {
+		svc := &services[i]
+		if svc.ID == "" {
+			svc.ID = fmt.Sprintf("svc-%d", i+1)
+		}
+		if _, ok := seen[svc.ID]; ok {
+			svc.ID = fmt.Sprintf("svc-%d", len(seen)+1)
+		}
+		seen[svc.ID] = struct{}{}
+		svc.Protocol = strings.ToLower(strings.TrimSpace(svc.Protocol))
+		if svc.Protocol == "" {
+			svc.Protocol = "tcp"
+		}
+		svc.LocalAddress = strings.TrimSpace(svc.LocalAddress)
+		if svc.LocalAddress == "" {
+			svc.LocalAddress = "127.0.0.1"
+		}
+		if svc.LocalPort == 0 {
+			svc.LocalPort = svc.RemotePort
+		}
+	}
+	return services
+}
+
+// GenerateTunnelAgentKey returns a base64 encoded secret and its SHA256 hash.
+func GenerateTunnelAgentKey() (secret string, hashed string, err error) {
+	buf := make([]byte, 32)
+	if _, err = rand.Read(buf); err != nil {
+		return "", "", err
+	}
+	secret = base64.RawStdEncoding.EncodeToString(buf)
+	hashBytes := sha256.Sum256([]byte(secret))
+	hashed = hex.EncodeToString(hashBytes[:])
+	return secret, hashed, nil
+}
+
+// HashTunnelAgentKey derives the stored hash for a tunnel-agent secret.
+func HashTunnelAgentKey(secret string) string {
+	sum := sha256.Sum256([]byte(secret))
+	return hex.EncodeToString(sum[:])
+}
+
 func (s *MemoryStore) snapshotLocked() ConfigSnapshot {
 	domainList := make([]DomainRoute, 0, len(s.domains))
 	for _, v := range s.domains {
@@ -851,6 +1106,28 @@ func (s *MemoryStore) snapshotLocked() ConfigSnapshot {
 			return tunnelList[i].BindPort < tunnelList[j].BindPort
 		}
 		return tunnelList[i].BindHost < tunnelList[j].BindHost
+	})
+
+	tunnelGroupList := make([]TunnelGroup, 0, len(s.tunnelGroups))
+	for _, v := range s.tunnelGroups {
+		tunnelGroupList = append(tunnelGroupList, v)
+	}
+	sort.Slice(tunnelGroupList, func(i, j int) bool {
+		if tunnelGroupList[i].Name == tunnelGroupList[j].Name {
+			return tunnelGroupList[i].ID < tunnelGroupList[j].ID
+		}
+		return tunnelGroupList[i].Name < tunnelGroupList[j].Name
+	})
+
+	tunnelAgentList := make([]TunnelAgent, 0, len(s.tunnelAgents))
+	for _, v := range s.tunnelAgents {
+		tunnelAgentList = append(tunnelAgentList, v)
+	}
+	sort.Slice(tunnelAgentList, func(i, j int) bool {
+		if tunnelAgentList[i].GroupID == tunnelAgentList[j].GroupID {
+			return tunnelAgentList[i].NodeID < tunnelAgentList[j].NodeID
+		}
+		return tunnelAgentList[i].GroupID < tunnelAgentList[j].GroupID
 	})
 
 	certificateList := make([]Certificate, 0, len(s.certificates))
@@ -927,6 +1204,8 @@ func (s *MemoryStore) snapshotLocked() ConfigSnapshot {
 		GeneratedAt:    time.Now().UTC(),
 		Domains:        domainList,
 		Tunnels:        tunnelList,
+		TunnelGroups:   tunnelGroupList,
+		TunnelAgents:   tunnelAgentList,
 		Certificates:   certificateList,
 		SSLPolicies:    sslPolicyList,
 		AccessPolicies: accessPolicyList,

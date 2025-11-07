@@ -169,19 +169,15 @@ docker compose down
 
 为方便批量部署，可使用仓库提供的脚本输出标准安装命令，在边缘主机直接执行即可完成安装。命令可以重复使用，每次执行都会在目标节点上生成新的节点 ID。
 
-1. **准备静态文件服务**
-   将仓库中的 `install/edge-install.sh` 以及 `install/binaries/` 目录暴露为 `https://your-domain.com/install/`。例如 Nginx 配置：
-
-   ```nginx
-   location /install/ {
-     alias /opt/anyproxy/install/;
-     types { }
-     default_type application/octet-stream;
-     autoindex off;
-   }
+1. **准备安装资源目录**
+   控制平面已通过 Go embed 内置 `install/edge-install.sh` 并暴露为 `https://your-domain.com/install/edge-install.sh`，无需额外的静态服务器。
+   需要自行构建 agent 压缩包：在仓库根执行
+   ```bash
+   chmod +x scripts/build-agent-bundles.sh
+   scripts/build-agent-bundles.sh v0.1.0
    ```
-
-   建议在控制平面节点执行 `chmod +x install/edge-install.sh scripts/generate-node-command.sh` 后再挂载目录。
+   脚本会在 `install/binaries/v0.1.0/` 下生成 `edge_linux_amd64.tar.gz`、`tunnel_linux_amd64.tar.gz` 及 `.sha256`；若希望保留“最新”指针，可运行 `ln -sfn v0.1.0 install/binaries/latest`。
+   运行控制平面时将 `install/` 目录挂载进去即可（项目自带的 `docker compose` 会把 `../install` 只读挂载到 `/app/install`；裸机部署可设置 `INSTALL_ASSETS_DIR=/path/to/install`）。
 
 2. **控制平面上生成命令**
 
@@ -195,13 +191,16 @@ docker compose down
    脚本会打印一段多行安装命令，并可选显示节点名称、用途、分组等信息。若需要为某个节点指定固定 ID，可额外传入 `--node <ID>`。
    生成的命令类似：
 
-   ```
+   ```bash
+   VERSION=$(ls install/binaries | sort -Vr | head -n1)   # 例如 v0.1.0
    curl -fsSL https://your-domain.com/install/edge-install.sh | sudo \
      ANYPROXY_CONTROL_PLANE=https://your-domain.com \
      ANYPROXY_NODE_TYPE=edge \
-     ANYPROXY_VERSION=v0.1.0 \
+     ANYPROXY_VERSION="${VERSION}" \
      bash
    ```
+   边缘节点仅部署 `edge-agent`，默认会渲染 `/etc/nginx/conf.d/*.conf`（HTTP）与 `/etc/haproxy/haproxy.cfg`（TCP/UDP）。若需要自定义路径或 HAProxy reload 命令，可传 `ANYPROXY_STREAM_OUTPUT_PATH`、`ANYPROXY_HAPROXY_RELOAD_CMD` 环境变量。
+   内网穿透节点在控制面创建 `tunnel-agent` 后，会拿到一个专属 key；生成命令时需通过 `--type tunnel --agent-key <KEY>`（或设置 `ANYPROXY_AGENT_KEY`），脚本会自动将 `ANYPROXY_TUNNEL_GROUP_ID`、`ANYPROXY_AGENT_KEY` 注入安装命令。
 
 3. **在目标节点执行命令**
 
@@ -216,6 +215,8 @@ docker compose down
 
 4. **安全提示**  
    由于命令可重复使用，请确保控制平面地址及任意注入的 `ANYPROXY_AGENT_TOKEN` 仅对受信主机可见。如命令泄露，可在控制平面侧旋转访问入口或刷新 Agent 访问令牌。
+
+> **内网主机（tunnel-agent）安装**：当需要在无公网 IP 的主机上运行隧道客户端时，将 `ANYPROXY_NODE_TYPE` 置为 `tunnel`。脚本仅安装 `tunnel-agent`，不会拉起 OpenResty/HAProxy，可通过 `ANYPROXY_OUTPUT_PATH` 指定本地测试用的 stream 配置路径（后续版本会改为真正的隧道客户端）。
 
 ---
 

@@ -14,39 +14,49 @@ import (
 
 func main() {
 	var (
-		controlPlane = flag.String("control-plane", "http://127.0.0.1:8080", "Control plane base URL")
-		nodeID       = flag.String("node-id", "", "Unique identifier for this edge node")
-		outputPath   = flag.String("output", "/usr/local/openresty/nginx/conf/nginx.conf", "Path to render nginx HTTP config")
-		certDir      = flag.String("cert-dir", "", "Directory to store edge TLS certificates (defaults to <output>/../certs)")
-		clientCADir  = flag.String("client-ca-dir", "", "Directory to store client CA bundles (defaults to cert-dir)")
-		templatePath = flag.String("template", "", "Optional custom template path")
-		authToken    = flag.String("auth-token", "", "Optional bearer token used to authenticate against control plane")
-		reloadCmdRaw = flag.String("reload", "openresty -s reload", "Command used to reload nginx/openresty (space separated)")
-		dryRun       = flag.Bool("dry-run", false, "Render config but skip reload commands")
-		groupID      = flag.String("group-id", "", "Optional node group identifier used for classification")
-		nodeCategory = flag.String("node-category", "", "Optional node category hint: cdn / tunnel")
-		nodeName     = flag.String("node-name", "", "Optional friendly name for this node")
+		controlPlane     = flag.String("control-plane", "http://127.0.0.1:8080", "Control plane base URL")
+		nodeID           = flag.String("node-id", "", "Unique identifier for this edge node")
+		outputPath       = flag.String("output", "/usr/local/openresty/nginx/conf/nginx.conf", "Path to render nginx HTTP config")
+		streamOutputPath = flag.String("stream-output", "/etc/haproxy/haproxy.cfg", "Path to render HAProxy TCP/UDP config")
+		certDir          = flag.String("cert-dir", "", "Directory to store edge TLS certificates (defaults to <output>/../certs)")
+		clientCADir      = flag.String("client-ca-dir", "", "Directory to store client CA bundles (defaults to cert-dir)")
+		templatePath     = flag.String("template", "", "Optional custom template path for HTTP config")
+		streamTemplate   = flag.String("stream-template", "", "Optional custom HAProxy template path")
+		authToken        = flag.String("auth-token", "", "Optional bearer token used to authenticate against control plane")
+		reloadCmdRaw     = flag.String("reload", "openresty -s reload", "Command used to reload nginx/openresty (space separated)")
+		haproxyReloadRaw = flag.String("haproxy-reload", "systemctl reload haproxy", "Command used to reload HAProxy (space separated, leave empty to skip)")
+		dryRun           = flag.Bool("dry-run", false, "Render config but skip reload commands")
+		groupID          = flag.String("group-id", "", "Optional node group identifier used for classification")
+		nodeCategory     = flag.String("node-category", "", "Optional node category hint: cdn / tunnel")
+		nodeName         = flag.String("node-name", "", "Optional friendly name for this node")
 	)
 	flag.Parse()
 
 	logger := log.New(os.Stdout, "[edge-agent] ", log.LstdFlags|log.Lmicroseconds)
 
 	reloadArgs := strings.Fields(strings.TrimSpace(*reloadCmdRaw))
+	var haproxyReloadArgs []string
+	if trimmed := strings.TrimSpace(*haproxyReloadRaw); trimmed != "" {
+		haproxyReloadArgs = strings.Fields(trimmed)
+	}
 
 	options := agent.EdgeOptions{
-		ControlPlaneURL: *controlPlane,
-		NodeID:          *nodeID,
-		OutputPath:      *outputPath,
-		CertificateDir:  *certDir,
-		ClientCADir:     *clientCADir,
-		TemplatePath:    *templatePath,
-		AuthToken:       *authToken,
-		GroupID:         *groupID,
-		NodeCategory:    *nodeCategory,
-		NodeName:        *nodeName,
-		ReloadCommand:   reloadArgs,
-		Logger:          logger,
-		DryRun:          *dryRun,
+		ControlPlaneURL:      *controlPlane,
+		NodeID:               *nodeID,
+		OutputPath:           *outputPath,
+		StreamOutputPath:     *streamOutputPath,
+		StreamTemplatePath:   *streamTemplate,
+		CertificateDir:       *certDir,
+		ClientCADir:          *clientCADir,
+		TemplatePath:         *templatePath,
+		AuthToken:            *authToken,
+		GroupID:              *groupID,
+		NodeCategory:         *nodeCategory,
+		NodeName:             *nodeName,
+		ReloadCommand:        reloadArgs,
+		HAProxyReloadCommand: haproxyReloadArgs,
+		Logger:               logger,
+		DryRun:               *dryRun,
 	}
 
 	edge, err := agent.NewEdgeAgent(options)

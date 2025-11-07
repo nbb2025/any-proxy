@@ -23,22 +23,25 @@ import (
 
 // EdgeOptions describes configuration for the edge agent.
 type EdgeOptions struct {
-	ControlPlaneURL string
-	NodeID          string
-	OutputPath      string
-	CertificateDir  string
-	ClientCADir     string
-	TemplatePath    string
-	AuthToken       string
-	GroupID         string
-	NodeName        string
-	NodeCategory    string
-	ReloadCommand   []string
-	WatchTimeout    time.Duration
-	RetryInterval   time.Duration
-	Client          HTTPClient
-	Logger          Logger
-	DryRun          bool
+	ControlPlaneURL      string
+	NodeID               string
+	OutputPath           string
+	StreamOutputPath     string
+	StreamTemplatePath   string
+	CertificateDir       string
+	ClientCADir          string
+	TemplatePath         string
+	HAProxyReloadCommand []string
+	AuthToken            string
+	GroupID              string
+	NodeName             string
+	NodeCategory         string
+	ReloadCommand        []string
+	WatchTimeout         time.Duration
+	RetryInterval        time.Duration
+	Client               HTTPClient
+	Logger               Logger
+	DryRun               bool
 }
 
 // EdgeAgent watches the control plane for domain updates and renders nginx config.
@@ -232,6 +235,19 @@ func (a *EdgeAgent) applySnapshot(ctx context.Context, snap configstore.ConfigSn
 		return fmt.Errorf("render edge template: %w", err)
 	}
 
+	var haproxyChanged bool
+	if strings.TrimSpace(a.opts.StreamOutputPath) != "" {
+		haproxyData := transformHAProxySnapshot(snap, a.opts.NodeID)
+		haproxyData.GeneratedAt = time.Now().UTC()
+		haproxyData.NodeID = a.opts.NodeID
+		haproxyData.Version = snap.Version
+		changed, err := templates.RenderHAProxy(haproxyData, a.opts.StreamOutputPath, a.opts.StreamTemplatePath)
+		if err != nil {
+			return fmt.Errorf("render haproxy template: %w", err)
+		}
+		haproxyChanged = changed
+	}
+
 	if a.opts.DryRun {
 		a.logger.Printf("[edge] dry-run: skip reload")
 		return nil
@@ -242,6 +258,12 @@ func (a *EdgeAgent) applySnapshot(ctx context.Context, snap configstore.ConfigSn
 			return fmt.Errorf("reload command failed: %w", err)
 		}
 		a.logger.Printf("[edge] reloaded via %s", strings.Join(a.opts.ReloadCommand, " "))
+	}
+	if haproxyChanged && len(a.opts.HAProxyReloadCommand) > 0 {
+		if err := runCommand(ctx, a.opts.HAProxyReloadCommand, a.logger); err != nil {
+			return fmt.Errorf("haproxy reload failed: %w", err)
+		}
+		a.logger.Printf("[edge] haproxy reloaded via %s", strings.Join(a.opts.HAProxyReloadCommand, " "))
 	}
 	return nil
 }
@@ -459,6 +481,35 @@ func transformEdgeSnapshot(snap configstore.ConfigSnapshot, nodeID string, certM
 	}
 
 	return out
+}
+
+func transformHAProxySnapshot(snap configstore.ConfigSnapshot, nodeID string) templates.HAProxyTemplateData {
+	data := templates.HAProxyTemplateData{
+		NodeID: nodeID,
+	}
+	for _, route := range snap.Tunnels {
+		if !routeAssigned(route.NodeIDs, nodeID) {
+			continue
+		}
+		mode := strings.ToLower(strings.TrimSpace(route.Protocol))
+		if mode != "udp" {
+			mode = "tcp"
+		}
+		bindHost := route.BindHost
+		if strings.TrimSpace(bindHost) == "" {
+			bindHost = "0.0.0.0"
+		}
+		name := makeIdentifier("haproxy", route.ID, fmt.Sprintf("%s%d", bindHost, route.BindPort))
+		data.Routes = append(data.Routes, templates.HAProxyRoute{
+			Name:                name,
+			Mode:                mode,
+			BindAddress:         fmt.Sprintf("%s:%d", bindHost, route.BindPort),
+			TargetAddress:       route.Target,
+			IdleTimeout:         formatDuration(route.IdleTimeout),
+			EnableProxyProtocol: route.Metadata.EnableProxyProtocol,
+		})
+	}
+	return data
 }
 
 func routeAssigned(assignments []string, nodeID string) bool {

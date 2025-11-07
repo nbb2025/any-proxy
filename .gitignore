@@ -14,3 +14,4 @@ node_modules/
 configs/generated/
 deploy/*.crt
 deploy/*.key
+.gocache/

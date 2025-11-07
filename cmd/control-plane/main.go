@@ -8,19 +8,24 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
 
+	installassets "anyproxy.dev/any-proxy"
 	"anyproxy.dev/any-proxy/internal/api"
 	"anyproxy.dev/any-proxy/internal/auth"
 	"anyproxy.dev/any-proxy/internal/configstore"
+	"golang.org/x/mod/semver"
 )
 
 func main() {
@@ -120,6 +125,12 @@ func main() {
 	apiServer.Register(protectedMux)
 
 	rootMux := http.NewServeMux()
+	installFS := http.FS(newInstallFS(logger))
+	installHandler := http.StripPrefix("/install/", http.FileServer(installFS))
+	rootMux.Handle("/install/", withNoStore(installHandler))
+	rootMux.Handle("/install", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/install/", http.StatusMovedPermanently)
+	}))
 	rootMux.Handle("/auth/login", auth.LoginHandler(authMgr))
 	rootMux.Handle("/auth/refresh", auth.RefreshHandler(authMgr))
 
@@ -160,6 +171,122 @@ func main() {
 	}
 
 	logger.Printf("control plane stopped")
+}
+
+func withNoStore(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		next.ServeHTTP(w, r)
+	})
+}
+
+func newInstallFS(logger *log.Logger) fs.FS {
+	embedded := installassets.FS()
+	diskDir := detectInstallAssetsDir()
+	if diskDir == "" {
+		logger.Printf("serving installer assets from embedded bundle only")
+		return embedded
+	}
+
+	absPath := diskDir
+	if resolved, err := filepath.Abs(diskDir); err == nil {
+		absPath = resolved
+	}
+	logger.Printf("serving installer assets from %s with embedded fallback", absPath)
+	return &compositeInstallFS{
+		disk:     os.DirFS(absPath),
+		embedded: embedded,
+		diskRoot: absPath,
+	}
+}
+
+func detectInstallAssetsDir() string {
+	candidates := []string{}
+	if envDir := strings.TrimSpace(os.Getenv("INSTALL_ASSETS_DIR")); envDir != "" {
+		candidates = append(candidates, envDir)
+	}
+	if exePath, err := os.Executable(); err == nil {
+		candidates = append(candidates, filepath.Join(filepath.Dir(exePath), "install"))
+	}
+	candidates = append(candidates, "install")
+	for _, dir := range candidates {
+		if dir == "" {
+			continue
+		}
+		info, err := os.Stat(dir)
+		if err == nil && info.IsDir() {
+			return dir
+		}
+	}
+	return ""
+}
+
+type compositeInstallFS struct {
+	disk     fs.FS
+	embedded fs.FS
+	diskRoot string
+}
+
+func (c *compositeInstallFS) Open(name string) (fs.File, error) {
+	if resolved := c.resolveLatestPath(name); resolved != "" {
+		name = resolved
+	}
+	if c.disk != nil {
+		f, err := c.disk.Open(name)
+		if err == nil {
+			return f, nil
+		}
+		if !errors.Is(err, fs.ErrNotExist) {
+			return nil, err
+		}
+	}
+	return c.embedded.Open(name)
+}
+
+func (c *compositeInstallFS) resolveLatestPath(name string) string {
+	const latestPrefix = "binaries/latest/"
+	if c.diskRoot == "" || !strings.HasPrefix(name, latestPrefix) {
+		return ""
+	}
+	latest := c.latestVersionDir()
+	if latest == "" {
+		return ""
+	}
+	return "binaries/" + latest + "/" + strings.TrimPrefix(name, latestPrefix)
+}
+
+func (c *compositeInstallFS) latestVersionDir() string {
+	binariesDir := filepath.Join(c.diskRoot, "binaries")
+	entries, err := os.ReadDir(binariesDir)
+	if err != nil {
+		return ""
+	}
+	var semverDirs []string
+	var otherDirs []string
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if semver.IsValid(name) {
+			semverDirs = append(semverDirs, name)
+		} else {
+			otherDirs = append(otherDirs, name)
+		}
+	}
+	if len(semverDirs) > 0 {
+		sort.Slice(semverDirs, func(i, j int) bool {
+			return semver.Compare(semverDirs[i], semverDirs[j]) > 0
+		})
+		return semverDirs[0]
+	}
+	if len(otherDirs) > 0 {
+		sort.Slice(otherDirs, func(i, j int) bool {
+			return strings.ToLower(otherDirs[i]) > strings.ToLower(otherDirs[j])
+		})
+		return otherDirs[0]
+	}
+	return ""
 }
 
 func loadSeed(store configstore.Store, path string) error {

@@ -25,6 +25,9 @@ OUTPUT_PATH="${ANYPROXY_OUTPUT_PATH:-}"
 STREAM_OUTPUT_PATH="${ANYPROXY_STREAM_OUTPUT_PATH:-}"
 OUTPUT_FORMAT="${ANYPROXY_OUTPUT_FMT:-text}"
 AGENT_TOKEN="${ANYPROXY_AGENT_TOKEN:-}"
+AGENT_KEY="${ANYPROXY_AGENT_KEY:-}"
+TUNNEL_GROUP="${ANYPROXY_TUNNEL_GROUP_ID:-}"
+HAPROXY_RELOAD="${ANYPROXY_HAPROXY_RELOAD_CMD:-}"
 CERT_DIR="${ANYPROXY_CERT_DIR:-}"
 CLIENT_CA_DIR="${ANYPROXY_CLIENT_CA_DIR:-}"
 
@@ -44,6 +47,9 @@ Options:
   --cert-dir PATH       Override agent certificate directory (default: env ANYPROXY_CERT_DIR)
   --client-ca-dir PATH  Override agent client CA directory (default: env ANYPROXY_CLIENT_CA_DIR or cert dir)
   --agent-token TOKEN   Embed control-plane bearer token for agents (default: env ANYPROXY_AGENT_TOKEN)
+  --agent-key KEY       (tunnel nodes) Provide tunnel-agent key issued by control plane (default: env ANYPROXY_AGENT_KEY)
+  --tunnel-group ID     (tunnel nodes) Override tunnel group identifier (default: env ANYPROXY_TUNNEL_GROUP_ID)
+  --haproxy-reload CMD  Override haproxy reload command (edge nodes; default: env ANYPROXY_HAPROXY_RELOAD_CMD)
   --format text|env     Output style (default: text; env for machine parsing)
 
 Environment:
@@ -121,6 +127,18 @@ while [[ $# -gt 0 ]]; do
       AGENT_TOKEN=${2:-}
       shift 2
       ;;
+    --agent-key)
+      AGENT_KEY=${2:-}
+      shift 2
+      ;;
+    --tunnel-group)
+      TUNNEL_GROUP=${2:-}
+      shift 2
+      ;;
+    --haproxy-reload)
+      HAPROXY_RELOAD=${2:-}
+      shift 2
+      ;;
     -h|--help)
       usage
       ;;
@@ -138,6 +156,11 @@ fi
 
 if [[ "$NODE_TYPE" != "edge" && "$NODE_TYPE" != "tunnel" ]]; then
   echo "[anyproxy-command] --type must be edge or tunnel" >&2
+  exit 1
+fi
+
+if [[ "$NODE_TYPE" == "tunnel" && -z $AGENT_KEY ]]; then
+  echo "[anyproxy-command] --agent-key (or ANYPROXY_AGENT_KEY) is required for tunnel nodes" >&2
   exit 1
 fi
 
@@ -186,6 +209,9 @@ fi
 if [[ -n $NODE_GROUP ]]; then
   CMD+=" ANYPROXY_NODE_GROUP_ID=$(escape "${NODE_GROUP}")"
 fi
+if [[ -n $TUNNEL_GROUP ]]; then
+  CMD+=" ANYPROXY_TUNNEL_GROUP_ID=$(escape "${TUNNEL_GROUP}")"
+fi
 if [[ -n $NODE_CATEGORY ]]; then
   CMD+=" ANYPROXY_NODE_CATEGORY=$(escape "${NODE_CATEGORY}")"
 fi
@@ -197,6 +223,12 @@ if [[ -n $CLIENT_CA_DIR ]]; then
 fi
 if [[ -n $AGENT_TOKEN ]]; then
   CMD+=" ANYPROXY_AGENT_TOKEN=$(escape "${AGENT_TOKEN}")"
+fi
+if [[ -n $AGENT_KEY ]]; then
+  CMD+=" ANYPROXY_AGENT_KEY=$(escape "${AGENT_KEY}")"
+fi
+if [[ -n $HAPROXY_RELOAD ]]; then
+  CMD+=" ANYPROXY_HAPROXY_RELOAD_CMD=$(escape "${HAPROXY_RELOAD}")"
 fi
 
 CMD+=" bash"

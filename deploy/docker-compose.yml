@@ -45,7 +45,7 @@ services:
     volumes:
       - ./configs:/configs:ro
       - ./deploy/pki:/app/pki:ro
-      - ../install/edge-install.sh:/app/install/edge-install.sh:ro
+      - ../install:/app/install:ro
     environment:
       CONTROL_PLANE_LISTEN: ${CONTROL_PLANE_LISTEN:-:8080}
       ETCD_ENDPOINTS: ${ETCD_ENDPOINTS:-http://etcd:2379}

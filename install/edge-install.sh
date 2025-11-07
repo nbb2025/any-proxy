@@ -258,6 +258,23 @@ check_glibc_version() {
   fi
 }
 
+get_root_available_kb() {
+  local kb=""
+  if kb=$(df --output=avail / 2>/dev/null | tail -n1 | tr -d ' '); then
+    :
+  else
+    kb=""
+  fi
+  if [[ -z "$kb" ]]; then
+    if kb=$(df -Pk / 2>/dev/null | awk 'NR==2 {print $4}'); then
+      :
+    else
+      kb=""
+    fi
+  fi
+  printf '%s\n' "$kb"
+}
+
 check_resource_baseline() {
   local cpu_count mem_kb mem_mb disk_kb disk_gb
   if command -v nproc >/dev/null 2>&1; then
@@ -275,10 +292,7 @@ check_resource_baseline() {
     die "system memory ${mem_mb}MB is below required ${MIN_MEMORY_MB}MB"
   fi
 
-  disk_kb=$(df -Pk --output=avail / 2>/dev/null | tail -n1 | tr -d ' ')
-  if [[ -z "$disk_kb" ]]; then
-    disk_kb=$(df -Pk / | awk 'NR==2 {print $4}')
-  fi
+  disk_kb=$(get_root_available_kb)
   if [[ -z "$disk_kb" ]]; then
     die "unable to determine available disk space on root filesystem"
   fi
@@ -434,6 +448,7 @@ VERSION="${ANYPROXY_VERSION:-latest}"
 RELOAD_CMD="${ANYPROXY_RELOAD_CMD:-nginx -s reload}"
 OUTPUT_PATH="${ANYPROXY_OUTPUT_PATH:-}"
 STREAM_OUTPUT_PATH="${ANYPROXY_STREAM_OUTPUT_PATH:-}"
+HAPROXY_RELOAD_CMD="${ANYPROXY_HAPROXY_RELOAD_CMD:-systemctl reload haproxy}"
 CERT_DIR="${ANYPROXY_CERT_DIR:-}"
 CLIENT_CA_DIR="${ANYPROXY_CLIENT_CA_DIR:-}"
 AGENT_AUTH_TOKEN="${ANYPROXY_AGENT_TOKEN:-}"
@@ -453,6 +468,7 @@ Environment overrides:
   ANYPROXY_RELOAD_CMD    reload command for nginx/openresty (fallback: "nginx -s reload")
   ANYPROXY_OUTPUT_PATH   default HTTP config output path
   ANYPROXY_STREAM_OUTPUT_PATH default stream config output path
+  ANYPROXY_HAPROXY_RELOAD_CMD reload command for haproxy (fallback: "systemctl reload haproxy")
   ANYPROXY_CERT_DIR      default certificate directory passed to agent
   ANYPROXY_CLIENT_CA_DIR client CA bundle directory passed to agent
   ANYPROXY_AGENT_TOKEN   optional bearer token supplied to agent via -auth-token
@@ -577,8 +593,6 @@ CONTROL_PLANE_URL=${CONTROL_PLANE_URL%/}
 if [[ "$NODE_TYPE" == "edge" ]]; then
   install_openresty
   install_haproxy_pkg
-else
-  install_haproxy_pkg
 fi
 
 TMPDIR=$(mktemp -d)
@@ -623,7 +637,7 @@ write_service() {
     echo "[Service]"
     printf "ExecStart=%s" "${exec_cmd}"
     for arg in "${exec_args[@]}"; do
-      printf " \\\\\n  %s" "$arg"
+      printf " \\\\\n  %q" "$arg"
     done
     echo
     echo "Restart=always"
@@ -638,26 +652,24 @@ SERVICES=()
 
 if [[ "$NODE_TYPE" == "edge" ]]; then
   download_agent "edge"
-  download_agent "tunnel"
 
   EDGE_INSTALL_PATH="/usr/local/bin/anyproxy-edge"
-  TUNNEL_INSTALL_PATH="/usr/local/bin/anyproxy-tunnel"
-  echo "[anyproxy-install] installing binaries to ${EDGE_INSTALL_PATH} and ${TUNNEL_INSTALL_PATH}"
+  echo "[anyproxy-install] installing binary to ${EDGE_INSTALL_PATH}"
   install -m 0755 "${TMPDIR}/edge-agent" "$EDGE_INSTALL_PATH"
-  install -m 0755 "${TMPDIR}/tunnel-agent" "$TUNNEL_INSTALL_PATH"
 
   EDGE_DEFAULT_OUTPUT="/etc/nginx/conf.d/anyproxy-${NODE_ID}.conf"
   EDGE_OUTPUT_PATH=${OUTPUT_PATH:-$EDGE_DEFAULT_OUTPUT}
   mkdir -p "$(dirname "$EDGE_OUTPUT_PATH")"
 
-  TUNNEL_DEFAULT_OUTPUT="/etc/nginx/stream.d/anyproxy-${NODE_ID}.conf"
-  TUNNEL_OUTPUT_PATH=${STREAM_OUTPUT_PATH:-$TUNNEL_DEFAULT_OUTPUT}
-  mkdir -p "$(dirname "$TUNNEL_OUTPUT_PATH")"
+  STREAM_DEFAULT_OUTPUT="/etc/haproxy/haproxy.cfg"
+  STREAM_OUTPUT_PATH=${STREAM_OUTPUT_PATH:-$STREAM_DEFAULT_OUTPUT}
+  mkdir -p "$(dirname "$STREAM_OUTPUT_PATH")"
 
   EDGE_EXEC_ARGS=(
     "-control-plane" "${CONTROL_PLANE_URL}"
     "-node-id" "${NODE_ID}"
     "-output" "${EDGE_OUTPUT_PATH}"
+    "-stream-output" "${STREAM_OUTPUT_PATH}"
   )
   if [[ -n $NODE_NAME ]]; then
     EDGE_EXEC_ARGS+=("-node-name" "${NODE_NAME}")
@@ -678,37 +690,15 @@ if [[ "$NODE_TYPE" == "edge" ]]; then
     EDGE_EXEC_ARGS+=("-client-ca-dir" "${CLIENT_CA_DIR}")
   fi
   EDGE_EXEC_ARGS+=("-reload" "${RELOAD_CMD}")
+  if [[ -n $HAPROXY_RELOAD_CMD ]]; then
+    EDGE_EXEC_ARGS+=("-haproxy-reload" "${HAPROXY_RELOAD_CMD}")
+  fi
 
   EDGE_SERVICE_NAME="anyproxy-edge-${NODE_ID}.service"
   EDGE_SERVICE_PATH="/etc/systemd/system/${EDGE_SERVICE_NAME}"
   write_service "$EDGE_SERVICE_PATH" "AnyProxy edge agent (${NODE_ID})" "$EDGE_INSTALL_PATH" "${EDGE_EXEC_ARGS[@]}"
   echo "[anyproxy-install] systemd unit written to ${EDGE_SERVICE_PATH}"
   SERVICES+=("$EDGE_SERVICE_NAME")
-
-  TUNNEL_EXEC_ARGS=(
-    "-control-plane" "${CONTROL_PLANE_URL}"
-    "-node-id" "${NODE_ID}"
-    "-output" "${TUNNEL_OUTPUT_PATH}"
-  )
-  if [[ -n $NODE_NAME ]]; then
-    TUNNEL_EXEC_ARGS+=("-node-name" "${NODE_NAME}")
-  fi
-  if [[ -n $NODE_CATEGORY ]]; then
-    TUNNEL_EXEC_ARGS+=("-node-category" "${NODE_CATEGORY}")
-  fi
-  if [[ -n $NODE_GROUP_ID ]]; then
-    TUNNEL_EXEC_ARGS+=("-group-id" "${NODE_GROUP_ID}")
-  fi
-  if [[ -n $AGENT_AUTH_TOKEN ]]; then
-    TUNNEL_EXEC_ARGS+=("-auth-token" "${AGENT_AUTH_TOKEN}")
-  fi
-  TUNNEL_EXEC_ARGS+=("-reload" "${RELOAD_CMD}")
-
-  TUNNEL_SERVICE_NAME="anyproxy-tunnel-${NODE_ID}.service"
-  TUNNEL_SERVICE_PATH="/etc/systemd/system/${TUNNEL_SERVICE_NAME}"
-  write_service "$TUNNEL_SERVICE_PATH" "AnyProxy tunnel agent (${NODE_ID})" "$TUNNEL_INSTALL_PATH" "${TUNNEL_EXEC_ARGS[@]}"
-  echo "[anyproxy-install] systemd unit written to ${TUNNEL_SERVICE_PATH}"
-  SERVICES+=("$TUNNEL_SERVICE_NAME")
 
   systemctl daemon-reload
   for svc in "${SERVICES[@]}"; do
@@ -718,7 +708,7 @@ if [[ "$NODE_TYPE" == "edge" ]]; then
 
   echo "[anyproxy-install] installation complete."
   echo "[anyproxy-install] HTTP config renders to ${EDGE_OUTPUT_PATH}"
-  echo "[anyproxy-install] Stream config renders to ${TUNNEL_OUTPUT_PATH}"
+  echo "[anyproxy-install] Stream config renders to ${STREAM_OUTPUT_PATH}"
 elif [[ "$NODE_TYPE" == "tunnel" ]]; then
   download_agent "tunnel"
 

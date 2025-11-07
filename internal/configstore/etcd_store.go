@@ -19,6 +19,8 @@ const (
 	defaultEtcdPrefix = "/any-proxy/"
 	domainsDir        = "domains/"
 	tunnelsDir        = "tunnels/"
+	tunnelGroupsDir   = "tunnel_groups/"
+	tunnelAgentsDir   = "tunnel_agents/"
 	certificatesDir   = "certificates/"
 	sslPoliciesDir    = "ssl_policies/"
 	accessPoliciesDir = "access_policies/"
@@ -586,6 +588,8 @@ func (e *EtcdStore) Snapshot(ctx context.Context) (ConfigSnapshot, error) {
 
 	domains := make([]DomainRoute, 0)
 	tunnels := make([]TunnelRoute, 0)
+	tunnelGroups := make([]TunnelGroup, 0)
+	tunnelAgents := make([]TunnelAgent, 0)
 	certificates := make([]Certificate, 0)
 	sslPolicies := make([]SSLPolicy, 0)
 	accessPolicies := make([]AccessPolicy, 0)
@@ -608,6 +612,18 @@ func (e *EtcdStore) Snapshot(ctx context.Context) (ConfigSnapshot, error) {
 				return ConfigSnapshot{}, fmt.Errorf("decode tunnel %s: %w", key, err)
 			}
 			tunnels = append(tunnels, route)
+		case strings.HasPrefix(key, tunnelGroupsDir):
+			var group TunnelGroup
+			if err := json.Unmarshal(kv.Value, &group); err != nil {
+				return ConfigSnapshot{}, fmt.Errorf("decode tunnel group %s: %w", key, err)
+			}
+			tunnelGroups = append(tunnelGroups, group)
+		case strings.HasPrefix(key, tunnelAgentsDir):
+			var agent TunnelAgent
+			if err := json.Unmarshal(kv.Value, &agent); err != nil {
+				return ConfigSnapshot{}, fmt.Errorf("decode tunnel agent %s: %w", key, err)
+			}
+			tunnelAgents = append(tunnelAgents, agent)
 		case strings.HasPrefix(key, certificatesDir):
 			var cert Certificate
 			if err := json.Unmarshal(kv.Value, &cert); err != nil {
@@ -664,6 +680,20 @@ func (e *EtcdStore) Snapshot(ctx context.Context) (ConfigSnapshot, error) {
 		return tunnels[i].BindHost < tunnels[j].BindHost
 	})
 
+	sort.Slice(tunnelGroups, func(i, j int) bool {
+		if tunnelGroups[i].Name == tunnelGroups[j].Name {
+			return tunnelGroups[i].ID < tunnelGroups[j].ID
+		}
+		return tunnelGroups[i].Name < tunnelGroups[j].Name
+	})
+
+	sort.Slice(tunnelAgents, func(i, j int) bool {
+		if tunnelAgents[i].GroupID == tunnelAgents[j].GroupID {
+			return tunnelAgents[i].NodeID < tunnelAgents[j].NodeID
+		}
+		return tunnelAgents[i].GroupID < tunnelAgents[j].GroupID
+	})
+
 	sort.Slice(certificates, func(i, j int) bool {
 		if certificates[i].Name == certificates[j].Name {
 			return certificates[i].ID < certificates[j].ID
@@ -714,6 +744,8 @@ func (e *EtcdStore) Snapshot(ctx context.Context) (ConfigSnapshot, error) {
 		GeneratedAt:    time.Now().UTC(),
 		Domains:        domains,
 		Tunnels:        tunnels,
+		TunnelGroups:   tunnelGroups,
+		TunnelAgents:   tunnelAgents,
 		Certificates:   certificates,
 		SSLPolicies:    sslPolicies,
 		AccessPolicies: accessPolicies,
@@ -768,6 +800,165 @@ func (e *EtcdStore) Watch(ctx context.Context, since int64) (ConfigSnapshot, err
 	}
 }
 
+// UpsertTunnelGroup stores tunnel group metadata.
+func (e *EtcdStore) UpsertTunnelGroup(group TunnelGroup) (ConfigSnapshot, TunnelGroup, error) {
+	group.Name = strings.TrimSpace(group.Name)
+	if group.Name == "" {
+		return ConfigSnapshot{}, TunnelGroup{}, ErrInvalidTunnelGroup
+	}
+	if group.ID == "" {
+		group.ID = uuid.NewString()
+	}
+	now := time.Now().UTC()
+	if group.CreatedAt.IsZero() {
+		group.CreatedAt = now
+	}
+	group.ListenAddress = strings.TrimSpace(group.ListenAddress)
+	if group.ListenAddress == "" {
+		group.ListenAddress = ":4433"
+	}
+	group.EdgeNodeIDs = dedupeStrings(group.EdgeNodeIDs)
+	group.Transports = normalizeTransports(group.Transports)
+	group.UpdatedAt = now
+
+	payload, err := json.Marshal(group)
+	if err != nil {
+		return ConfigSnapshot{}, TunnelGroup{}, fmt.Errorf("marshal tunnel group: %w", err)
+	}
+
+	ctx, cancel := e.withCtx(context.Background())
+	defer cancel()
+
+	if _, err = e.client.Put(ctx, e.tunnelGroupKey(group.ID), string(payload)); err != nil {
+		return ConfigSnapshot{}, TunnelGroup{}, fmt.Errorf("put tunnel group: %w", err)
+	}
+
+	snap, err := e.Snapshot(context.Background())
+	if err != nil {
+		return ConfigSnapshot{}, TunnelGroup{}, err
+	}
+	return snap, group, nil
+}
+
+// DeleteTunnelGroup removes a tunnel ingress definition.
+func (e *EtcdStore) DeleteTunnelGroup(id string) (ConfigSnapshot, error) {
+	ctx, cancel := e.withCtx(context.Background())
+	defer cancel()
+
+	resp, err := e.client.Get(ctx, e.tunnelGroupKey(id))
+	if err != nil {
+		return ConfigSnapshot{}, fmt.Errorf("get tunnel group: %w", err)
+	}
+	if len(resp.Kvs) == 0 {
+		return ConfigSnapshot{}, ErrTunnelGroupNotFound
+	}
+
+	agentResp, err := e.client.Get(ctx, e.tunnelAgentsPrefix(), clientv3.WithPrefix())
+	if err != nil {
+		return ConfigSnapshot{}, fmt.Errorf("list tunnel agents: %w", err)
+	}
+	for _, kv := range agentResp.Kvs {
+		var agent TunnelAgent
+		if err := json.Unmarshal(kv.Value, &agent); err != nil {
+			return ConfigSnapshot{}, fmt.Errorf("decode tunnel agent %s: %w", string(kv.Key), err)
+		}
+		if agent.GroupID == id {
+			return ConfigSnapshot{}, ErrTunnelGroupInUse
+		}
+	}
+
+	if _, err := e.client.Delete(ctx, e.tunnelGroupKey(id)); err != nil {
+		return ConfigSnapshot{}, fmt.Errorf("delete tunnel group: %w", err)
+	}
+
+	return e.Snapshot(context.Background())
+}
+
+// UpsertTunnelAgent stores tunnel client metadata.
+func (e *EtcdStore) UpsertTunnelAgent(agent TunnelAgent) (ConfigSnapshot, TunnelAgent, error) {
+	agent.NodeID = strings.TrimSpace(agent.NodeID)
+	agent.GroupID = strings.TrimSpace(agent.GroupID)
+	agent.KeyHash = strings.TrimSpace(agent.KeyHash)
+	if agent.NodeID == "" || agent.GroupID == "" || agent.KeyHash == "" {
+		return ConfigSnapshot{}, TunnelAgent{}, ErrInvalidTunnelAgent
+	}
+	if agent.ID == "" {
+		agent.ID = uuid.NewString()
+	}
+
+	ctx, cancel := e.withCtx(context.Background())
+	defer cancel()
+
+	groupResp, err := e.client.Get(ctx, e.tunnelGroupKey(agent.GroupID))
+	if err != nil {
+		return ConfigSnapshot{}, TunnelAgent{}, fmt.Errorf("get tunnel group: %w", err)
+	}
+	if len(groupResp.Kvs) == 0 {
+		return ConfigSnapshot{}, TunnelAgent{}, ErrTunnelGroupNotFound
+	}
+
+	now := time.Now().UTC()
+	resp, err := e.client.Get(ctx, e.tunnelAgentKey(agent.ID))
+	if err != nil {
+		return ConfigSnapshot{}, TunnelAgent{}, fmt.Errorf("get tunnel agent: %w", err)
+	}
+	if len(resp.Kvs) > 0 {
+		var existing TunnelAgent
+		if err := json.Unmarshal(resp.Kvs[0].Value, &existing); err != nil {
+			return ConfigSnapshot{}, TunnelAgent{}, fmt.Errorf("decode tunnel agent: %w", err)
+		}
+		if agent.CreatedAt.IsZero() {
+			agent.CreatedAt = existing.CreatedAt
+		}
+		if agent.KeyVersion == 0 {
+			agent.KeyVersion = existing.KeyVersion
+		}
+		if agent.KeyHash == "" {
+			agent.KeyHash = existing.KeyHash
+		}
+	} else {
+		if agent.CreatedAt.IsZero() {
+			agent.CreatedAt = now
+		}
+		if agent.KeyVersion == 0 {
+			agent.KeyVersion = 1
+		}
+	}
+
+	agent.Services = normalizeServices(agent.Services)
+	agent.UpdatedAt = now
+
+	payload, err := json.Marshal(agent)
+	if err != nil {
+		return ConfigSnapshot{}, TunnelAgent{}, fmt.Errorf("marshal tunnel agent: %w", err)
+	}
+
+	if _, err := e.client.Put(ctx, e.tunnelAgentKey(agent.ID), string(payload)); err != nil {
+		return ConfigSnapshot{}, TunnelAgent{}, fmt.Errorf("put tunnel agent: %w", err)
+	}
+
+	snap, err := e.Snapshot(context.Background())
+	if err != nil {
+		return ConfigSnapshot{}, TunnelAgent{}, err
+	}
+	return snap, agent, nil
+}
+
+// DeleteTunnelAgent removes a tunnel agent definition.
+func (e *EtcdStore) DeleteTunnelAgent(id string) (ConfigSnapshot, error) {
+	ctx, cancel := e.withCtx(context.Background())
+	defer cancel()
+
+	resp, err := e.client.Delete(ctx, e.tunnelAgentKey(id))
+	if err != nil {
+		return ConfigSnapshot{}, fmt.Errorf("delete tunnel agent: %w", err)
+	}
+	if resp.Deleted == 0 {
+		return ConfigSnapshot{}, ErrTunnelAgentNotFound
+	}
+	return e.Snapshot(context.Background())
+}
+
 func (e *EtcdStore) domainKey(id string) string {
 	return e.prefix + domainsDir + id
 }
@@ -792,6 +983,14 @@ func (e *EtcdStore) rewriteRuleKey(id string) string {
 	return e.prefix + rewriteRulesDir + id
 }
 
+func (e *EtcdStore) tunnelGroupKey(id string) string {
+	return e.prefix + tunnelGroupsDir + id
+}
+
+func (e *EtcdStore) tunnelAgentKey(id string) string {
+	return e.prefix + tunnelAgentsDir + id
+}
+
 func (e *EtcdStore) nodeGroupKey(id string) string {
 	return e.prefix + nodeGroupsDir + id
 }
@@ -806,6 +1005,14 @@ func (e *EtcdStore) nodeGroupsPrefix() string {
 
 func (e *EtcdStore) nodesPrefix() string {
 	return e.prefix + nodesDir
+}
+
+func (e *EtcdStore) tunnelGroupsPrefix() string {
+	return e.prefix + tunnelGroupsDir
+}
+
+func (e *EtcdStore) tunnelAgentsPrefix() string {
+	return e.prefix + tunnelAgentsDir
 }
 
 func (e *EtcdStore) withCtx(parent context.Context) (context.Context, context.CancelFunc) {

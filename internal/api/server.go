@@ -69,10 +69,14 @@ func (s *Server) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/nodes/", s.handleNodesByID)
 	mux.HandleFunc("/v1/node-groups", s.handleNodeGroups)
 	mux.HandleFunc("/v1/node-groups/", s.handleNodeGroupsByID)
+	mux.HandleFunc("/v1/tunnel-groups", s.handleTunnelGroups)
+	mux.HandleFunc("/v1/tunnel-groups/", s.handleTunnelGroupsByID)
 	mux.HandleFunc("/v1/domains", s.handleDomains)
 	mux.HandleFunc("/v1/domains/", s.handleDomainsByID)
 	mux.HandleFunc("/v1/tunnels", s.handleTunnels)
 	mux.HandleFunc("/v1/tunnels/", s.handleTunnelsByID)
+	mux.HandleFunc("/v1/tunnel-agents", s.handleTunnelAgents)
+	mux.HandleFunc("/v1/tunnel-agents/", s.handleTunnelAgentsByID)
 	mux.HandleFunc("/v1/certificates", s.handleCertificates)
 	mux.HandleFunc("/v1/certificates/", s.handleCertificatesByID)
 	mux.HandleFunc("/v1/ssl-policies", s.handleSSLPolicies)
@@ -368,6 +372,116 @@ func (s *Server) handleNodeGroupsByID(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (s *Server) handleTunnelGroups(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		snap, err := s.store.Snapshot(r.Context())
+		if err != nil {
+			http.Error(w, fmt.Sprintf("snapshot error: %v", err), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"groups":  snap.TunnelGroups,
+			"version": snap.Version,
+		})
+	case http.MethodPost:
+		var payload TunnelGroupPayload
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			http.Error(w, fmt.Sprintf("invalid payload: %v", err), http.StatusBadRequest)
+			return
+		}
+		group, err := payload.toTunnelGroup(nil)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("validation error: %v", err), http.StatusBadRequest)
+			return
+		}
+		snap, stored, err := s.store.UpsertTunnelGroup(group)
+		if err != nil {
+			switch {
+			case errors.Is(err, configstore.ErrInvalidTunnelGroup):
+				http.Error(w, err.Error(), http.StatusBadRequest)
+			default:
+				http.Error(w, fmt.Sprintf("store error: %v", err), http.StatusInternalServerError)
+			}
+			return
+		}
+		writeJSON(w, http.StatusCreated, map[string]any{
+			"group":   stored,
+			"version": snap.Version,
+		})
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) handleTunnelGroupsByID(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimPrefix(r.URL.Path, "/v1/tunnel-groups/")
+	if id == "" {
+		http.Error(w, "missing group id", http.StatusBadRequest)
+		return
+	}
+
+	switch r.Method {
+	case http.MethodPatch:
+		var payload TunnelGroupPayload
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			http.Error(w, fmt.Sprintf("invalid payload: %v", err), http.StatusBadRequest)
+			return
+		}
+		payload.ID = id
+
+		snap, err := s.store.Snapshot(r.Context())
+		if err != nil {
+			http.Error(w, fmt.Sprintf("snapshot error: %v", err), http.StatusInternalServerError)
+			return
+		}
+		existing := findTunnelGroupByID(snap, id)
+		if existing == nil {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+
+		group, err := payload.toTunnelGroup(existing)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("validation error: %v", err), http.StatusBadRequest)
+			return
+		}
+		group.ID = id
+
+		snap, stored, err := s.store.UpsertTunnelGroup(group)
+		if err != nil {
+			switch {
+			case errors.Is(err, configstore.ErrInvalidTunnelGroup):
+				http.Error(w, err.Error(), http.StatusBadRequest)
+			default:
+				http.Error(w, fmt.Sprintf("store error: %v", err), http.StatusInternalServerError)
+			}
+			return
+		}
+
+		writeJSON(w, http.StatusOK, map[string]any{
+			"group":   stored,
+			"version": snap.Version,
+		})
+	case http.MethodDelete:
+		snap, err := s.store.DeleteTunnelGroup(id)
+		if err != nil {
+			switch {
+			case errors.Is(err, configstore.ErrTunnelGroupNotFound):
+				http.Error(w, "not found", http.StatusNotFound)
+			case errors.Is(err, configstore.ErrTunnelGroupInUse):
+				http.Error(w, err.Error(), http.StatusConflict)
+			default:
+				http.Error(w, fmt.Sprintf("store error: %v", err), http.StatusInternalServerError)
+			}
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"version": snap.Version})
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
 func (s *Server) handleDomains(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
@@ -463,6 +577,68 @@ func (s *Server) handleTunnelsByID(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			http.Error(w, fmt.Sprintf("delete failed: %v", err), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) handleTunnelAgents(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		snap, err := s.store.Snapshot(r.Context())
+		if err != nil {
+			http.Error(w, fmt.Sprintf("snapshot error: %v", err), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"agents":  snap.TunnelAgents,
+			"version": snap.Version,
+		})
+	case http.MethodPost:
+		s.handleUpsertTunnelAgent(w, r, "")
+	case http.MethodPut:
+		s.handleUpsertTunnelAgent(w, r, "")
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) handleTunnelAgentsByID(w http.ResponseWriter, r *http.Request) {
+	path := strings.TrimPrefix(r.URL.Path, "/v1/tunnel-agents/")
+	if path == "" {
+		http.Error(w, "missing agent id", http.StatusBadRequest)
+		return
+	}
+	parts := strings.Split(path, "/")
+	id := parts[0]
+	if id == "" {
+		http.Error(w, "missing agent id", http.StatusBadRequest)
+		return
+	}
+
+	if len(parts) == 2 && parts[1] == "refresh-key" {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		s.handleTunnelAgentRefreshKey(w, r, id)
+		return
+	}
+
+	switch r.Method {
+	case http.MethodPatch:
+		s.handleUpsertTunnelAgent(w, r, id)
+	case http.MethodDelete:
+		if _, err := s.store.DeleteTunnelAgent(id); err != nil {
+			switch {
+			case errors.Is(err, configstore.ErrTunnelAgentNotFound):
+				http.Error(w, "not found", http.StatusNotFound)
+			default:
+				http.Error(w, fmt.Sprintf("store error: %v", err), http.StatusInternalServerError)
+			}
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
@@ -652,6 +828,109 @@ func (s *Server) handleUpsertTunnel(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, snap)
 }
 
+func (s *Server) handleUpsertTunnelAgent(w http.ResponseWriter, r *http.Request, forcedID string) {
+	var payload TunnelAgentPayload
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		http.Error(w, fmt.Sprintf("invalid payload: %v", err), http.StatusBadRequest)
+		return
+	}
+	if forcedID != "" {
+		payload.ID = forcedID
+	}
+
+	var existing *configstore.TunnelAgent
+	if payload.ID != "" {
+		snap, err := s.store.Snapshot(r.Context())
+		if err != nil {
+			http.Error(w, fmt.Sprintf("snapshot error: %v", err), http.StatusInternalServerError)
+			return
+		}
+		existing = findTunnelAgentByID(snap, payload.ID)
+		if existing == nil {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+	}
+
+	agent, rotateKey, err := payload.toTunnelAgent(existing)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("validation error: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	var secret string
+	if existing == nil || rotateKey || strings.TrimSpace(agent.KeyHash) == "" {
+		sec, hash, err := configstore.GenerateTunnelAgentKey()
+		if err != nil {
+			http.Error(w, fmt.Sprintf("key generation error: %v", err), http.StatusInternalServerError)
+			return
+		}
+		secret = sec
+		agent.KeyHash = hash
+		if existing != nil {
+			agent.KeyVersion = existing.KeyVersion + 1
+		} else if agent.KeyVersion == 0 {
+			agent.KeyVersion = 1
+		}
+	}
+
+	snap, stored, err := s.store.UpsertTunnelAgent(agent)
+	if err != nil {
+		switch {
+		case errors.Is(err, configstore.ErrInvalidTunnelAgent):
+			http.Error(w, err.Error(), http.StatusBadRequest)
+		case errors.Is(err, configstore.ErrTunnelGroupNotFound):
+			http.Error(w, "tunnel group not found", http.StatusBadRequest)
+		default:
+			http.Error(w, fmt.Sprintf("store error: %v", err), http.StatusInternalServerError)
+		}
+		return
+	}
+
+	resp := map[string]any{
+		"agent":   stored,
+		"version": snap.Version,
+	}
+	if secret != "" {
+		resp["agentKey"] = secret
+	}
+	writeJSON(w, http.StatusCreated, resp)
+}
+
+func (s *Server) handleTunnelAgentRefreshKey(w http.ResponseWriter, r *http.Request, id string) {
+	snap, err := s.store.Snapshot(r.Context())
+	if err != nil {
+		http.Error(w, fmt.Sprintf("snapshot error: %v", err), http.StatusInternalServerError)
+		return
+	}
+	existing := findTunnelAgentByID(snap, id)
+	if existing == nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+
+	agent := *existing
+	secret, hash, err := configstore.GenerateTunnelAgentKey()
+	if err != nil {
+		http.Error(w, fmt.Sprintf("key generation error: %v", err), http.StatusInternalServerError)
+		return
+	}
+	agent.KeyHash = hash
+	agent.KeyVersion++
+
+	newSnap, stored, err := s.store.UpsertTunnelAgent(agent)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("store error: %v", err), http.StatusInternalServerError)
+		return
+	}
+	resp := map[string]any{
+		"agent":    stored,
+		"version":  newSnap.Version,
+		"agentKey": secret,
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
 func (s *Server) handleUpsertCertificate(w http.ResponseWriter, r *http.Request) {
 	var payload CertificatePayload
 	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
@@ -780,6 +1059,168 @@ func (p NodeGroupPayload) toNodeGroup(existing *configstore.NodeGroup) (configst
 	}
 
 	return group, nil
+}
+
+type TunnelGroupPayload struct {
+	ID             string   `json:"id,omitempty"`
+	Name           string   `json:"name"`
+	Description    string   `json:"description,omitempty"`
+	ListenAddress  string   `json:"listenAddress,omitempty"`
+	EdgeNodeIDs    []string `json:"edgeNodeIds,omitempty"`
+	Transports     []string `json:"transports,omitempty"`
+	EnableCompress *bool    `json:"enableCompress,omitempty"`
+}
+
+func (p TunnelGroupPayload) toTunnelGroup(existing *configstore.TunnelGroup) (configstore.TunnelGroup, error) {
+	var group configstore.TunnelGroup
+	if existing != nil {
+		group = *existing
+	}
+
+	if id := strings.TrimSpace(p.ID); id != "" {
+		group.ID = id
+	} else if existing == nil {
+		group.ID = ""
+	}
+
+	if name := strings.TrimSpace(p.Name); name != "" {
+		group.Name = name
+	} else if existing == nil {
+		return configstore.TunnelGroup{}, fmt.Errorf("name is required")
+	}
+
+	if desc := strings.TrimSpace(p.Description); desc != "" || p.Description == "" {
+		group.Description = strings.TrimSpace(p.Description)
+	}
+
+	if addr := strings.TrimSpace(p.ListenAddress); addr != "" {
+		group.ListenAddress = addr
+	}
+
+	if len(p.EdgeNodeIDs) > 0 {
+		group.EdgeNodeIDs = append([]string(nil), p.EdgeNodeIDs...)
+	}
+	if len(p.Transports) > 0 {
+		group.Transports = append([]string(nil), p.Transports...)
+	}
+	if p.EnableCompress != nil {
+		group.EnableCompress = *p.EnableCompress
+	}
+	return group, nil
+}
+
+type TunnelAgentPayload struct {
+	ID          string                      `json:"id,omitempty"`
+	NodeID      string                      `json:"nodeId"`
+	GroupID     string                      `json:"groupId"`
+	Description string                      `json:"description,omitempty"`
+	Enabled     *bool                       `json:"enabled,omitempty"`
+	RotateKey   bool                        `json:"rotateKey,omitempty"`
+	Services    []TunnelAgentServicePayload `json:"services,omitempty"`
+}
+
+type TunnelAgentServicePayload struct {
+	ID                string `json:"id,omitempty"`
+	Protocol          string `json:"protocol"`
+	LocalAddress      string `json:"localAddress"`
+	LocalPort         int    `json:"localPort"`
+	RemotePort        int    `json:"remotePort"`
+	EnableCompression *bool  `json:"enableCompression,omitempty"`
+	Description       string `json:"description,omitempty"`
+}
+
+func (p TunnelAgentPayload) toTunnelAgent(existing *configstore.TunnelAgent) (configstore.TunnelAgent, bool, error) {
+	var agent configstore.TunnelAgent
+	if existing != nil {
+		agent = *existing
+	} else {
+		agent.Enabled = true
+	}
+
+	if id := strings.TrimSpace(p.ID); id != "" {
+		agent.ID = id
+	}
+
+	if nodeID := strings.TrimSpace(p.NodeID); nodeID != "" || existing == nil {
+		if nodeID == "" {
+			return configstore.TunnelAgent{}, false, fmt.Errorf("nodeId is required")
+		}
+		agent.NodeID = nodeID
+	}
+
+	if groupID := strings.TrimSpace(p.GroupID); groupID != "" || existing == nil {
+		if groupID == "" {
+			return configstore.TunnelAgent{}, false, fmt.Errorf("groupId is required")
+		}
+		agent.GroupID = groupID
+	}
+
+	if desc := strings.TrimSpace(p.Description); desc != "" || p.Description == "" {
+		agent.Description = strings.TrimSpace(p.Description)
+	}
+
+	if p.Enabled != nil {
+		agent.Enabled = *p.Enabled
+	}
+
+	if p.Services != nil {
+		services := make([]configstore.TunnelAgentService, len(p.Services))
+		for i := range p.Services {
+			svc, err := p.Services[i].toService()
+			if err != nil {
+				return configstore.TunnelAgent{}, false, err
+			}
+			services[i] = svc
+		}
+		agent.Services = services
+	}
+
+	return agent, p.RotateKey, nil
+}
+
+func (p TunnelAgentServicePayload) toService() (configstore.TunnelAgentService, error) {
+	if p.RemotePort <= 0 {
+		return configstore.TunnelAgentService{}, fmt.Errorf("remotePort must be > 0")
+	}
+	svc := configstore.TunnelAgentService{
+		ID:           strings.TrimSpace(p.ID),
+		Protocol:     strings.TrimSpace(p.Protocol),
+		LocalAddress: strings.TrimSpace(p.LocalAddress),
+		LocalPort:    p.LocalPort,
+		RemotePort:   p.RemotePort,
+		Description:  strings.TrimSpace(p.Description),
+	}
+	if svc.Protocol == "" {
+		svc.Protocol = "tcp"
+	}
+	if svc.LocalAddress == "" {
+		svc.LocalAddress = "127.0.0.1"
+	}
+	if svc.LocalPort == 0 {
+		svc.LocalPort = svc.RemotePort
+	}
+	if p.EnableCompression != nil {
+		svc.EnableCompression = *p.EnableCompression
+	}
+	return svc, nil
+}
+
+func findTunnelGroupByID(snap configstore.ConfigSnapshot, id string) *configstore.TunnelGroup {
+	for i := range snap.TunnelGroups {
+		if snap.TunnelGroups[i].ID == id {
+			return &snap.TunnelGroups[i]
+		}
+	}
+	return nil
+}
+
+func findTunnelAgentByID(snap configstore.ConfigSnapshot, id string) *configstore.TunnelAgent {
+	for i := range snap.TunnelAgents {
+		if snap.TunnelAgents[i].ID == id {
+			return &snap.TunnelAgents[i]
+		}
+	}
+	return nil
 }
 
 type NodeRegisterPayload struct {
