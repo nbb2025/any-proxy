@@ -30,6 +30,7 @@ TUNNEL_GROUP="${ANYPROXY_TUNNEL_GROUP_ID:-}"
 HAPROXY_RELOAD="${ANYPROXY_HAPROXY_RELOAD_CMD:-}"
 CERT_DIR="${ANYPROXY_CERT_DIR:-}"
 CLIENT_CA_DIR="${ANYPROXY_CLIENT_CA_DIR:-}"
+EDGE_CANDIDATES="${ANYPROXY_EDGE_CANDIDATES:-}"
 
 usage() {
   cat <<'EOF'
@@ -49,6 +50,7 @@ Options:
   --agent-token TOKEN   Embed control-plane bearer token for agents (default: env ANYPROXY_AGENT_TOKEN)
   --agent-key KEY       (tunnel nodes) Provide tunnel-agent key issued by control plane (default: env ANYPROXY_AGENT_KEY)
   --tunnel-group ID     (tunnel nodes) Override tunnel group identifier (default: env ANYPROXY_TUNNEL_GROUP_ID)
+  --edge-candidate ADDR (tunnel nodes) Edge candidate host:port (repeatable; default: env ANYPROXY_EDGE_CANDIDATES)
   --haproxy-reload CMD  Override haproxy reload command (edge nodes; default: env ANYPROXY_HAPROXY_RELOAD_CMD)
   --format text|env     Output style (default: text; env for machine parsing)
 
@@ -65,6 +67,7 @@ Environment:
   ANYPROXY_NODE_NAME     Default node display name
   ANYPROXY_NODE_GROUP_ID Default node group identifier
   ANYPROXY_NODE_CATEGORY Default node category hint
+  ANYPROXY_EDGE_CANDIDATES Default edge candidates for tunnel nodes
 EOF
   exit 1
 }
@@ -135,6 +138,10 @@ while [[ $# -gt 0 ]]; do
       TUNNEL_GROUP=${2:-}
       shift 2
       ;;
+    --edge-candidate)
+      EDGE_CANDIDATES+="${EDGE_CANDIDATES:+,}${2:-}"
+      shift 2
+      ;;
     --haproxy-reload)
       HAPROXY_RELOAD=${2:-}
       shift 2
@@ -164,7 +171,7 @@ if [[ "$NODE_TYPE" == "tunnel" && -z $AGENT_KEY ]]; then
   exit 1
 fi
 
-NODE_CATEGORY=$(echo "${NODE_CATEGORY,,}")
+NODE_CATEGORY=$(printf '%s' "${NODE_CATEGORY}" | tr '[:upper:]' '[:lower:]')
 case "$NODE_CATEGORY" in
   cdn|tunnel|"") ;;
   *)
@@ -227,15 +234,28 @@ fi
 if [[ -n $AGENT_KEY ]]; then
   CMD+=" ANYPROXY_AGENT_KEY=$(escape "${AGENT_KEY}")"
 fi
+if [[ -n $EDGE_CANDIDATES ]]; then
+  CMD+=" ANYPROXY_EDGE_CANDIDATES=$(escape "${EDGE_CANDIDATES}")"
+fi
 if [[ -n $HAPROXY_RELOAD ]]; then
   CMD+=" ANYPROXY_HAPROXY_RELOAD_CMD=$(escape "${HAPROXY_RELOAD}")"
 fi
 
 CMD+=" bash"
 
+UNINSTALL_BASE="${CONTROL_PLANE_URL%/}/install/edge-uninstall.sh"
+UNINSTALL_NODE_ID_ENV=""
+if [[ -n $NODE_ID ]]; then
+  UNINSTALL_NODE_ID_ENV="ANYPROXY_NODE_ID=$(escape "${NODE_ID}")"
+else
+  UNINSTALL_NODE_ID_ENV="ANYPROXY_NODE_ID=<节点ID>"
+fi
+UNINSTALL_CMD="curl -fsSL ${UNINSTALL_BASE} | sudo ANYPROXY_NODE_TYPE=$(escape "${NODE_TYPE}") ${UNINSTALL_NODE_ID_ENV} bash"
+
 if [[ "$OUTPUT_FORMAT" == "env" ]]; then
   {
     printf 'COMMAND=%s\n' "$CMD"
+    printf 'UNINSTALL_COMMAND=%s\n' "$UNINSTALL_CMD"
     printf 'CONTROL_PLANE_URL=%s\n' "$CONTROL_PLANE_URL"
     printf 'NODE_TYPE=%s\n' "$NODE_TYPE"
     printf 'NODE_ID=%s\n' "$NODE_ID"
@@ -271,3 +291,11 @@ else
 fi
 echo
 echo "$CMD"
+
+echo
+echo "如需卸载，可执行："
+echo "$UNINSTALL_CMD"
+if [[ "$NODE_TYPE" == "edge" ]]; then
+  echo
+  echo "[anyproxy-command] Edge 节点将自动安装 edgectl，可通过 'sudo edgectl upgrade|restart|stop|uninstall' 管理本机 Agent。"
+fi

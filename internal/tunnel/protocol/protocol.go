@@ -16,8 +16,19 @@ type HandshakeMessage struct {
 	NodeID              string       `json:"nodeId"`
 	Key                 string       `json:"key"`
 	Version             int          `json:"version"`
+	GroupID             string       `json:"groupId,omitempty"`
+	Role                string       `json:"role,omitempty"`
+	ServiceID           string       `json:"serviceId,omitempty"`
+	Token               string       `json:"token,omitempty"`
+	Services            []ServiceAdvertisement `json:"services,omitempty"`
 	PreferredTransports []string     `json:"preferredTransports,omitempty"` // quic, websocket
 	Capabilities        Capabilities `json:"capabilities"`
+}
+
+// ServiceAdvertisement declares a service exposed by the agent.
+type ServiceAdvertisement struct {
+	ID       string `json:"id"`
+	Protocol string `json:"protocol,omitempty"`
 }
 
 // Capabilities advertises optional features.
@@ -52,6 +63,7 @@ type DataFrame struct {
 const (
 	MessageTypeHandshake = "handshake"
 	MessageTypeHeartbeat = "heartbeat"
+	MessageTypeBridge    = "bridge"
 )
 
 // Envelope is a generic tunnel control message.
@@ -59,6 +71,14 @@ type Envelope struct {
 	Type      string            `json:"type"`
 	Handshake *HandshakeMessage `json:"handshake,omitempty"`
 	Heartbeat *Heartbeat        `json:"heartbeat,omitempty"`
+	Bridge    *BridgeCommand    `json:"bridge,omitempty"`
+}
+
+// BridgeCommand instructs agents to take actions related to data channels.
+type BridgeCommand struct {
+	Action    string `json:"action"`
+	Token     string `json:"token,omitempty"`
+	ServiceID string `json:"serviceId,omitempty"`
 }
 
 // WriteEnvelope serialises an envelope with a length prefix.

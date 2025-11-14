@@ -17,6 +17,11 @@ http {
     {{- $sslPolicy := sslPolicyFor $.SSLPolicies . }}
     {{- $cert := certificateFor $.Certificates .AccountID }}
     upstream {{ .UpstreamName }} {
+{{- if eq .LoadBalancingAlgorithm "ip_hash" }}
+        ip_hash;
+{{- else if eq .LoadBalancingAlgorithm "least_conn" }}
+        least_conn;
+{{- end }}
 {{- range .Upstreams }}
         server {{ .Address }}{{ if .Weight }} weight={{ .Weight }}{{ end }}{{ if .MaxFails }} max_fails={{ .MaxFails }}{{ end }}{{ if .FailTimeout }} fail_timeout={{ .FailTimeout }}{{ end }};
 {{- if .HealthCheck }}
@@ -29,14 +34,21 @@ http {
     }
 
     server {
+{{- if .InboundListeners }}
+{{- range .InboundListeners }}
+        listen {{ .Port }}{{ if eq .Protocol "HTTPS" }} ssl http2{{ end }};
+{{- end }}
+{{- else }}
         listen 80;
 {{- if .EnableTLS }}
         listen 443 ssl http2;
-{{- if $cert }}
+{{- end }}
+{{- end }}
+
+{{- if and .EnableTLS $cert }}
         ssl_certificate     {{ $cert.CertificatePath }};
 {{- if $cert.KeyPath }}
         ssl_certificate_key {{ $cert.KeyPath }};
-{{- end }}
 {{- end }}
 {{- end }}
 
@@ -78,13 +90,17 @@ http {
 {{- end }}
 
         location / {
-            proxy_pass http://{{ .UpstreamName }};
+            proxy_pass {{ .ProxyScheme }}://{{ .UpstreamName }};
             proxy_set_header Host $host;
             proxy_set_header X-Real-IP $remote_addr;
             proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
             proxy_set_header X-Forwarded-Proto $scheme;
             proxy_http_version 1.1;
             proxy_set_header Connection "";
+{{- if eq .ProxyScheme "https" }}
+            proxy_ssl_server_name on;
+            proxy_ssl_verify off;
+{{- end }}
         }
     }
 {{- end }}

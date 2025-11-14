@@ -17,5 +17,4 @@ deploy/*.key
 .gocache/
 install/binaries/
 deploy/etcd-data/
-./install/binaries/
-/install/binaries/v0.1.0/
+deploy/pg-data/

@@ -1,4 +1,23 @@
 services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: any-proxy-postgres
+    environment:
+      POSTGRES_USER: ${PG_USER:-anyproxy}
+      POSTGRES_PASSWORD: ${PG_PASSWORD:-anyproxy}
+      POSTGRES_DB: ${PG_DATABASE:-anyproxy}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PG_USER:-anyproxy} -d ${PG_DATABASE:-anyproxy}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    ports:
+      - "${PG_PORT:-5432}:5432"
+    volumes:
+      - ./pg-data:/var/lib/postgresql/data
+    networks:
+      - any-proxy
+
   etcd:
     image: quay.io/coreos/etcd:v3.5.15
     container_name: any-proxy-etcd
@@ -40,6 +59,8 @@ services:
       dockerfile: deploy/control-plane.Dockerfile
     image: any-proxy/control-plane:local
     depends_on:
+      postgres:
+        condition: service_healthy
       etcd:
         condition: service_healthy
     volumes:
@@ -55,12 +76,16 @@ services:
       ETCD_KEY: ${ETCD_KEY:-}
       ETCD_CA: ${ETCD_CA:-}
       ETCD_INSECURE_SKIP_VERIFY: ${ETCD_INSECURE_SKIP_VERIFY:-}
+      PG_DSN: ${PG_DSN:-postgres://anyproxy:anyproxy@postgres:5432/anyproxy?sslmode=disable}
+      PG_MAX_IDLE: ${PG_MAX_IDLE:-4}
+      PG_MAX_OPEN: ${PG_MAX_OPEN:-16}
+      PG_CONN_MAX_LIFETIME: ${PG_CONN_MAX_LIFETIME:-2h}
       AUTH_USERNAME: ${AUTH_USERNAME:?auth username required}
       AUTH_PASSWORD: ${AUTH_PASSWORD:?auth password required}
       AUTH_JWT_SECRET: ${AUTH_JWT_SECRET:?jwt secret required}
       AUTH_ACCESS_TOKEN_TTL: ${AUTH_ACCESS_TOKEN_TTL:-24h}
       AUTH_REFRESH_TOKEN_TTL: ${AUTH_REFRESH_TOKEN_TTL:-336h}
-    command:
+    entrypoint:
       - /bin/sh
       - -c
       - >
@@ -73,6 +98,10 @@ services:
         $${ETCD_KEY:+-etcd-key $${ETCD_KEY}}
         $${ETCD_CA:+-etcd-ca $${ETCD_CA}}
         $${ETCD_INSECURE_SKIP_VERIFY:+-etcd-insecure-skip-verify}
+        $${PG_DSN:+-pg-dsn $${PG_DSN}}
+        $${PG_MAX_IDLE:+-pg-max-idle $${PG_MAX_IDLE}}
+        $${PG_MAX_OPEN:+-pg-max-open $${PG_MAX_OPEN}}
+        $${PG_CONN_MAX_LIFETIME:+-pg-conn-max-lifetime $${PG_CONN_MAX_LIFETIME}}
     networks:
       - any-proxy
 

@@ -1,6 +1,6 @@
 "use client"
 
-import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import { Card } from "@/components/ui/card"
 
 interface ResourcesTabsProps {
   summary: {
@@ -10,14 +10,41 @@ interface ResourcesTabsProps {
   }
 }
 
+const formatNumber = (value: number) => {
+  if (value > 1000) {
+    return `${(value / 1000).toFixed(1)}k`
+  }
+  return String(value)
+}
+
 export function ResourcesTabs({ summary }: ResourcesTabsProps) {
+  const stats = [
+    {
+      label: "名称（应用代理）",
+      value: summary.totalDomains,
+      hint: "所有 L7 代理的数量",
+    },
+    {
+      label: "转发配置",
+      value: summary.totalUpstreams,
+      hint: "当前生效的上游条目",
+    },
+    {
+      label: "证书状态",
+      value: summary.tlsEnabled,
+      hint: "启用 HTTPS 的代理数量",
+    },
+  ]
+
   return (
-    <Tabs defaultValue="overview" className="w-full">
-      <TabsList className="flex-wrap justify-start">
-        <TabsTrigger value="overview">域名 ({summary.totalDomains})</TabsTrigger>
-        <TabsTrigger value="upstreams">上游节点 ({summary.totalUpstreams})</TabsTrigger>
-        <TabsTrigger value="tls">启用 HTTPS ({summary.tlsEnabled})</TabsTrigger>
-      </TabsList>
-    </Tabs>
+    <div className="grid gap-3 md:grid-cols-3">
+      {stats.map((stat) => (
+        <Card key={stat.label} className="border-border bg-card p-4">
+          <p className="text-xs uppercase text-muted-foreground/70">{stat.label}</p>
+          <p className="text-2xl font-semibold text-foreground">{formatNumber(stat.value)}</p>
+          <p className="text-xs text-muted-foreground">{stat.hint}</p>
+        </Card>
+      ))}
+    </div>
   )
 }

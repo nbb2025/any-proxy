@@ -71,8 +71,65 @@
 
 ## 7. 阶段性交付计划
 
-1. **Stage 2A（当前）**：落地协议骨架、控制面数据结构、edge/tunnel agent 新模块的骨干代码，确保 can build；暂不启用实际流量切换。
-2. **Stage 2B**：完成 QUIC 实现、HAProxy 集成、控制面 API；提供 end-to-end MVP。
-3. **Stage 2C**：增加 WebSocket fallback、压缩、metrics、UI 展示等。
+### Stage 2A（当前） – 隧道数据面 MVP
 
-本设计文档将随着实现更新，作为 Stage 2 交付的基础。
+目标：打通 edge ↔ tunnel-agent 的最小可用通道，Lay out 基础配置结构。
+
+#### 范围
+
+1. **edge-agent 与 HAProxy**
+   - 调整 HAProxy 模板：穿透型路由的 backend 统一指向本地 `tunnel-server`（如 `127.0.0.1:<bridge-port>`），由 `tunnel-server` 负责将请求映射到具体 tunnel-agent。
+   - `tunnelServerManager` 根据 snapshot 启停服务器，维护 `listenAddr -> keyHash -> SessionInfo`，并暴露 bridge 端口供 HAProxy 使用。
+   - `configstore`/snapshot 新增 `TunnelIngress`，描述每个分组在 edge 侧需要开放的监听地址、允许的 key、所属节点等；`edge-agent` 基于它渲染/更新 `tunnelServer`。
+
+2. **tunnel-server 基础实现**
+   - 接受来自 tunnel-agent 的连接（先用 TCP 骨干，后续迭代 QUIC/WebSocket），完成握手、key 校验、会话注册/心跳。
+   - 接入 HAProxy：监听本地 bridge 端口，建立 “HAProxy -> tunnelServer -> tunnelAgent” 的 TCP pipeline（先不做多路复用）。
+
+3. **配置结构**
+   - Snapshot 中包含 `TunnelIngress`、`TunnelAgents` 的 key 映射，edge-agent 只需根据 snapshot 启停服务，不需要本地持久状态。
+   - TunnelRoute.Target 暂解释为 “目的 agent service ID”，真正的地址由 tunnel-server 内部映射。
+
+> TIps：Stage 2A 目的在于打通最小链路，允许先用简单的 TCP 转发和 key map，压缩/多路复用/QUIC 等放在 Stage 2B。
+
+### Stage 2B – tunnel-agent 替换 & 端到端联调
+
+1. **tunnel-agent**
+   - 改为真正的隧道客户端：读取 `services[]`，本地监听 TCP 端口，把流量封装在 tunnel 流中（先支持 TCP，多路复用后再扩展 UDP）。
+   - 实现 handshake / heartbeat / 重连逻辑，优先使用 QUIC，必要时 fallback WebSocket。
+   - 安装脚本/CLI：生成命令时自动注入 `agentKey`/`groupId`/`edgeCandidates`，systemd 单元使用 env 变量启动。
+
+2. **edge-agent / tunnel-server**
+   - 完整接入多路复用（单连接多流）、心跳超时、key 版本管理。
+   - HAProxy/`tunnel-server` 对接：支持 TCP → tunnel 流的桥接，UDP 先延后。
+
+3. **E2E 验证**
+   - 通过控制面创建 tunnelGroup/tunnelAgent，部署 edge/tunnel 节点，验证从公网到内网的 TCP 流量闭环。
+
+### Stage 2C – 控制平面与 UI
+
+1. **API**
+   - 扩展 `/v1/tunnel-groups`、`/v1/tunnel-agents`：创建/修改/刷新 key、查询在线会话。
+   - 提供 CLI/前端接口，生成包含 key 的安装命令。
+
+2. **前端**
+   - “隧道分组 & Agent” 管理界面（列表、状态、刷新 key、安装命令）。
+   - 会话/心跳视图：展示每个 agent 的在线状态、最后心跳、绑定 edge。
+
+3. **配置联动**
+   - Edge/tunnel agent 在 UI 操作后自动刷新 snapshot，确保配置闭环。
+
+### Stage 2D – 监控 & 告警
+
+1. **指标**
+   - Master：总隧道数、在线 agent 数、key 刷新次数等。
+   - Edge-agent：每个 tunnel-server 的活跃会话、心跳延迟、失败次数。
+   - Tunnel-agent：重连次数、心跳 RTT、本地服务健康。
+
+2. **执法**
+   - 导出 Prometheus metrics、webhook 通知（如 key 验证失败、连接超时）。
+   - 统一日志格式，记录 handshake、断线、告警事件，便于排查。
+
+---
+
+本设计文档会随着每个 Stage 的实现阶段性更新。当前重点是 Stage 2A（隧道数据面 MVP），完成后再推进后续阶段。

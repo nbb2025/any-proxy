@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"sort"
 	"strings"
 	"sync"
@@ -36,6 +37,8 @@ type Store interface {
 	DeleteNodeGroup(id string) (ConfigSnapshot, error)
 	RegisterOrUpdateNode(reg NodeRegistration) (ConfigSnapshot, EdgeNode, error)
 	UpdateNodeGroup(nodeID, groupID string) (ConfigSnapshot, EdgeNode, error)
+	UpdateNode(nodeID string, update NodeUpdate) (ConfigSnapshot, EdgeNode, error)
+	DeleteNode(id string) (ConfigSnapshot, error)
 	UpsertTunnelGroup(group TunnelGroup) (ConfigSnapshot, TunnelGroup, error)
 	DeleteTunnelGroup(id string) (ConfigSnapshot, error)
 	UpsertTunnelAgent(agent TunnelAgent) (ConfigSnapshot, TunnelAgent, error)
@@ -65,18 +68,33 @@ type Upstream struct {
 
 // RouteMeta describes optional behaviours that edge templates might need.
 type RouteMeta struct {
-	Sticky       bool          `json:"sticky,omitempty"`
-	TimeoutProxy time.Duration `json:"timeoutProxy,omitempty"`
-	TimeoutRead  time.Duration `json:"timeoutRead,omitempty"`
-	TimeoutSend  time.Duration `json:"timeoutSend,omitempty"`
+	Sticky                 bool            `json:"sticky,omitempty"`
+	TimeoutProxy           time.Duration   `json:"timeoutProxy,omitempty"`
+	TimeoutRead            time.Duration   `json:"timeoutRead,omitempty"`
+	TimeoutSend            time.Duration   `json:"timeoutSend,omitempty"`
+	DisplayName            string          `json:"displayName,omitempty"`
+	GroupName              string          `json:"groupName,omitempty"`
+	Remark                 string          `json:"remark,omitempty"`
+	ForwardMode            string          `json:"forwardMode,omitempty"`
+	LoadBalancingAlgorithm string          `json:"loadBalancingAlgorithm,omitempty"`
+	InboundListeners       []RouteListener `json:"inboundListeners,omitempty"`
+	OutboundListeners      []RouteListener `json:"outboundListeners,omitempty"`
+}
+
+type RouteListener struct {
+	Protocol string `json:"protocol,omitempty"`
+	Port     int    `json:"port,omitempty"`
 }
 
 // TunnelRoute configures an inbound tunnel that will be relayed to an internal service.
 type TunnelRoute struct {
 	ID          string        `json:"id"`
+	GroupID     string        `json:"groupId"`
 	Protocol    string        `json:"protocol"`
 	BindHost    string        `json:"bindHost"`
 	BindPort    int           `json:"bindPort"`
+	BridgeBind  string        `json:"bridgeBind"`
+	BridgePort  int           `json:"bridgePort"`
 	Target      string        `json:"target"`
 	NodeIDs     []string      `json:"nodeIds"`
 	IdleTimeout time.Duration `json:"idleTimeout,omitempty"`
@@ -278,29 +296,45 @@ type NodeGroup struct {
 
 // EdgeNode stores metadata reported by running agents.
 type EdgeNode struct {
-	ID        string       `json:"id"`
-	GroupID   string       `json:"groupId"`
-	Category  NodeCategory `json:"category"`
-	Kind      string       `json:"kind"`
-	Name      string       `json:"name,omitempty"`
-	Hostname  string       `json:"hostname,omitempty"`
-	Addresses []string     `json:"addresses,omitempty"`
-	Version   string       `json:"version,omitempty"`
-	LastSeen  time.Time    `json:"lastSeen"`
-	CreatedAt time.Time    `json:"createdAt"`
-	UpdatedAt time.Time    `json:"updatedAt"`
+	ID                  string       `json:"id"`
+	GroupID             string       `json:"groupId"`
+	Category            NodeCategory `json:"category"`
+	Kind                string       `json:"kind"`
+	Name                string       `json:"name,omitempty"`
+	Hostname            string       `json:"hostname,omitempty"`
+	Addresses           []string     `json:"addresses,omitempty"`
+	Version             string       `json:"version,omitempty"`
+	AgentVersion        string       `json:"agentVersion,omitempty"`
+	AgentDesiredVersion string       `json:"agentDesiredVersion,omitempty"`
+	LastUpgradeAt       time.Time    `json:"lastUpgradeAt,omitempty"`
+	NodeKeyHash         string       `json:"nodeKeyHash,omitempty"`
+	NodeKeyVersion      int          `json:"nodeKeyVersion,omitempty"`
+	LastSeen            time.Time    `json:"lastSeen"`
+	CreatedAt           time.Time    `json:"createdAt"`
+	UpdatedAt           time.Time    `json:"updatedAt"`
 }
 
 // NodeRegistration carries metadata supplied by agents on join/heartbeat.
 type NodeRegistration struct {
-	ID        string
-	Kind      string
-	GroupID   string
-	Name      string
-	Category  NodeCategory
-	Hostname  string
-	Addresses []string
-	Version   string
+	ID             string
+	Kind           string
+	GroupID        string
+	Name           string
+	Category       NodeCategory
+	Hostname       string
+	Addresses      []string
+	Version        string
+	AgentVersion   string
+	NodeKeyHash    string
+	NodeKeyVersion int
+}
+
+// NodeUpdate carries mutable node metadata for control-plane operations.
+type NodeUpdate struct {
+	GroupID             *string
+	Name                *string
+	Category            *NodeCategory
+	AgentDesiredVersion *string
 }
 
 // ConfigSnapshot is the immutable configuration artefact that agents consume.
@@ -438,12 +472,52 @@ func (s *MemoryStore) DeleteDomain(id string) (ConfigSnapshot, error) {
 
 // UpsertTunnel inserts or replaces a tunnel route.
 func (s *MemoryStore) UpsertTunnel(route TunnelRoute) (ConfigSnapshot, error) {
+	route.GroupID = strings.TrimSpace(route.GroupID)
+	if route.GroupID == "" {
+		return ConfigSnapshot{}, ErrInvalidTunnelGroup
+	}
+	route.Protocol = strings.ToLower(strings.TrimSpace(route.Protocol))
+	if route.Protocol == "" {
+		route.Protocol = "tcp"
+	}
+	route.BindHost = strings.TrimSpace(route.BindHost)
+	if route.BindHost == "" {
+		route.BindHost = "0.0.0.0"
+	}
+	if route.BindPort <= 0 || route.BindPort > 65535 {
+		return ConfigSnapshot{}, fmt.Errorf("bind port must be between 1 and 65535")
+	}
+	route.Target = strings.TrimSpace(route.Target)
+	route.BridgeBind = strings.TrimSpace(route.BridgeBind)
+	if route.BridgeBind == "" {
+		route.BridgeBind = "127.0.0.1"
+	}
+	if route.BridgePort < 0 || route.BridgePort > 65535 {
+		return ConfigSnapshot{}, fmt.Errorf("bridge port must be between 0 and 65535")
+	}
+	route.NodeIDs = dedupeStrings(route.NodeIDs)
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if _, ok := s.tunnelGroups[route.GroupID]; !ok {
+		return ConfigSnapshot{}, ErrTunnelGroupNotFound
+	}
 
 	if route.ID == "" {
 		route.ID = uuid.NewString()
 	}
+
+	if route.BridgePort == 0 {
+		port, err := s.allocateBridgePortLocked(route.ID, route.BridgeBind)
+		if err != nil {
+			return ConfigSnapshot{}, err
+		}
+		route.BridgePort = port
+	} else if s.bridgeAddrInUseLocked(route.ID, route.BridgeBind, route.BridgePort) {
+		return ConfigSnapshot{}, fmt.Errorf("bridge address %s:%d already in use", route.BridgeBind, route.BridgePort)
+	}
+
 	route.UpdatedAt = time.Now().UTC()
 	s.tunnels[route.ID] = route
 	s.bumpLocked()
@@ -750,9 +824,34 @@ func (s *MemoryStore) RegisterOrUpdateNode(reg NodeRegistration) (ConfigSnapshot
 		node.Version = ver
 		changed = true
 	}
+	if agentVer := strings.TrimSpace(reg.AgentVersion); agentVer != "" && agentVer != node.AgentVersion {
+		node.AgentVersion = agentVer
+		changed = true
+	}
+
+	if hash := strings.TrimSpace(reg.NodeKeyHash); hash != "" {
+		keyChanged := false
+		if hash != node.NodeKeyHash {
+			node.NodeKeyHash = hash
+			keyChanged = true
+			changed = true
+		}
+		if reg.NodeKeyVersion > 0 && reg.NodeKeyVersion != node.NodeKeyVersion {
+			node.NodeKeyVersion = reg.NodeKeyVersion
+			changed = true
+		} else if node.NodeKeyVersion == 0 && keyChanged {
+			node.NodeKeyVersion = 1
+			changed = true
+		}
+	}
 
 	node.LastSeen = now
 	node.UpdatedAt = now
+	if node.AgentDesiredVersion != "" && node.AgentVersion != "" && node.AgentDesiredVersion == node.AgentVersion {
+		node.AgentDesiredVersion = ""
+		node.LastUpgradeAt = now
+		changed = true
+	}
 
 	s.nodes[node.ID] = node
 	if changed {
@@ -763,6 +862,12 @@ func (s *MemoryStore) RegisterOrUpdateNode(reg NodeRegistration) (ConfigSnapshot
 
 // UpdateNodeGroup moves a node to the specified group.
 func (s *MemoryStore) UpdateNodeGroup(nodeID, groupID string) (ConfigSnapshot, EdgeNode, error) {
+	gid := groupID
+	return s.UpdateNode(nodeID, NodeUpdate{GroupID: &gid})
+}
+
+// UpdateNode mutates node metadata such as group membership or display name.
+func (s *MemoryStore) UpdateNode(nodeID string, update NodeUpdate) (ConfigSnapshot, EdgeNode, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -771,26 +876,54 @@ func (s *MemoryStore) UpdateNodeGroup(nodeID, groupID string) (ConfigSnapshot, E
 		return ConfigSnapshot{}, EdgeNode{}, ErrNodeNotFound
 	}
 
-	targetID := groupID
-	if strings.TrimSpace(targetID) == "" {
-		targetID = defaultWaitingGroupID
+	changed := false
+	if update.GroupID != nil {
+		targetID := strings.TrimSpace(*update.GroupID)
+		var group NodeGroup
+		if targetID == "" {
+			group = s.ensureSystemGroupLocked(NodeCategoryWaiting)
+		} else {
+			group = s.nodeGroups[targetID]
+			if group.ID == "" {
+				return ConfigSnapshot{}, EdgeNode{}, ErrGroupNotFound
+			}
+		}
+		if node.GroupID != group.ID {
+			node.GroupID = group.ID
+			node.Category = group.Category
+			changed = true
+		}
 	}
-	group, ok := s.nodeGroups[targetID]
-	if !ok {
-		return ConfigSnapshot{}, EdgeNode{}, ErrGroupNotFound
+	if update.Name != nil {
+		name := strings.TrimSpace(*update.Name)
+		if node.Name != name {
+			node.Name = name
+			changed = true
+		}
+	}
+	if update.Category != nil {
+		category := *update.Category
+		group := s.ensureSystemGroupLocked(category)
+		if node.Category != category || node.GroupID != group.ID {
+			node.Category = category
+			node.GroupID = group.ID
+			changed = true
+		}
+	}
+	if update.AgentDesiredVersion != nil {
+		desired := strings.TrimSpace(*update.AgentDesiredVersion)
+		if node.AgentDesiredVersion != desired {
+			node.AgentDesiredVersion = desired
+			changed = true
+		}
 	}
 
-	if node.GroupID == group.ID {
-		return s.snapshotLocked(), node, nil
+	if changed {
+		node.UpdatedAt = time.Now().UTC()
+		s.nodes[nodeID] = node
+		s.bumpLocked()
 	}
 
-	now := time.Now().UTC()
-	node.GroupID = group.ID
-	node.Category = group.Category
-	node.UpdatedAt = now
-	s.nodes[nodeID] = node
-
-	s.bumpLocked()
 	return s.snapshotLocked(), node, nil
 }
 
@@ -896,6 +1029,61 @@ func (s *MemoryStore) DeleteTunnelAgent(id string) (ConfigSnapshot, error) {
 		return ConfigSnapshot{}, ErrTunnelAgentNotFound
 	}
 	delete(s.tunnelAgents, id)
+	s.bumpLocked()
+	return s.snapshotLocked(), nil
+}
+
+func (s *MemoryStore) bridgeAddrInUseLocked(routeID, bind string, port int) bool {
+	bind = strings.TrimSpace(bind)
+	for id, route := range s.tunnels {
+		if id == routeID {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(route.BridgeBind), bind) && route.BridgePort == port {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *MemoryStore) allocateBridgePortLocked(routeID, bind string) (int, error) {
+	if existing, ok := s.tunnels[routeID]; ok {
+		if existing.BridgeBind == bind && existing.BridgePort > 0 {
+			if !s.bridgeAddrInUseLocked(routeID, bind, existing.BridgePort) {
+				return existing.BridgePort, nil
+			}
+		}
+	}
+	base := 40000
+	if routeID != "" {
+		sum := crc32.ChecksumIEEE([]byte(routeID))
+		base = 40000 + int(sum%20000)
+	}
+	if base < 1024 {
+		base = 40000
+	}
+	port := base
+	for attempts := 0; attempts < 20000; attempts++ {
+		candidate := port + attempts
+		if candidate > 65535 {
+			candidate = 1024 + (candidate-1024)%64511
+		}
+		if !s.bridgeAddrInUseLocked(routeID, bind, candidate) {
+			return candidate, nil
+		}
+	}
+	return 0, fmt.Errorf("no bridge ports available for %s", bind)
+}
+
+// DeleteNode removes the specified edge node from the inventory.
+func (s *MemoryStore) DeleteNode(id string) (ConfigSnapshot, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.nodes[id]; !ok {
+		return ConfigSnapshot{}, ErrNodeNotFound
+	}
+	delete(s.nodes, id)
 	s.bumpLocked()
 	return s.snapshotLocked(), nil
 }
@@ -1066,6 +1254,25 @@ func normalizeServices(services []TunnelAgentService) []TunnelAgentService {
 
 // GenerateTunnelAgentKey returns a base64 encoded secret and its SHA256 hash.
 func GenerateTunnelAgentKey() (secret string, hashed string, err error) {
+	return generateSecretKey()
+}
+
+// HashTunnelAgentKey derives the stored hash for a tunnel-agent secret.
+func HashTunnelAgentKey(secret string) string {
+	return hashSecret(secret)
+}
+
+// GenerateNodeKey returns a base64 encoded secret tied to an edge node.
+func GenerateNodeKey() (secret string, hashed string, err error) {
+	return generateSecretKey()
+}
+
+// HashNodeKey derives the stored hash for a node secret.
+func HashNodeKey(secret string) string {
+	return hashSecret(secret)
+}
+
+func generateSecretKey() (secret string, hashed string, err error) {
 	buf := make([]byte, 32)
 	if _, err = rand.Read(buf); err != nil {
 		return "", "", err
@@ -1076,8 +1283,7 @@ func GenerateTunnelAgentKey() (secret string, hashed string, err error) {
 	return secret, hashed, nil
 }
 
-// HashTunnelAgentKey derives the stored hash for a tunnel-agent secret.
-func HashTunnelAgentKey(secret string) string {
+func hashSecret(secret string) string {
 	sum := sha256.Sum256([]byte(secret))
 	return hex.EncodeToString(sum[:])
 }

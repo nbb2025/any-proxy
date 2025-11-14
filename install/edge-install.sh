@@ -37,6 +37,8 @@ PKG_INSTALL_CMD=""
 PKG_CHECK_CMD=""
 SKIP_REQUIREMENTS="${ANYPROXY_IGNORE_REQUIREMENTS:-0}"
 PKG_UPDATE_DONE=""
+EDGECTL_BIN_PATH="/usr/local/bin/edgectl"
+EDGECTL_STATE_FILE="/etc/anyproxy/edgectl.env"
 
 ensure_root
 
@@ -455,6 +457,11 @@ AGENT_AUTH_TOKEN="${ANYPROXY_AGENT_TOKEN:-}"
 NODE_NAME="${ANYPROXY_NODE_NAME:-}"
 NODE_CATEGORY="${ANYPROXY_NODE_CATEGORY:-}"
 NODE_GROUP_ID="${ANYPROXY_NODE_GROUP_ID:-}"
+AGENT_VERSION="${ANYPROXY_AGENT_VERSION:-}"
+AGENT_KEY="${ANYPROXY_AGENT_KEY:-}"
+AGENT_KEY_FILE="${ANYPROXY_AGENT_KEY_FILE:-}"
+TUNNEL_GROUP_ID="${ANYPROXY_TUNNEL_GROUP_ID:-}"
+EDGE_CANDIDATES_RAW="${ANYPROXY_EDGE_CANDIDATES:-}"
 
 usage() {
   cat <<'EOF'
@@ -471,10 +478,16 @@ Environment overrides:
   ANYPROXY_HAPROXY_RELOAD_CMD reload command for haproxy (fallback: "systemctl reload haproxy")
   ANYPROXY_CERT_DIR      default certificate directory passed to agent
   ANYPROXY_CLIENT_CA_DIR client CA bundle directory passed to agent
+  ANYPROXY_AGENT_VERSION optional agent semantic version override reported to control plane (default: auto-detect)
   ANYPROXY_AGENT_TOKEN   optional bearer token supplied to agent via -auth-token
   ANYPROXY_NODE_NAME     default node display name passed to agent
   ANYPROXY_NODE_CATEGORY default node category hint (cdn/tunnel)
   ANYPROXY_NODE_GROUP_ID default node group identifier
+  ANYPROXY_STATUS_FILE   edge-agent 状态文件路径（默认 /var/lib/anyproxy/edge-status-<NODE_ID>.env）
+  ANYPROXY_AGENT_KEY     tunnel nodes: agent key issued by control plane
+  ANYPROXY_AGENT_KEY_FILE tunnel nodes: path to agent key file
+  ANYPROXY_TUNNEL_GROUP_ID tunnel nodes: override tunnel group id
+  ANYPROXY_EDGE_CANDIDATES tunnel nodes: comma separated edge candidates (host:port)
   ANYPROXY_IGNORE_REQUIREMENTS set to 1 to skip OS/CPU/memory/disk checks (NOT recommended)
 EOF
   exit 1
@@ -522,6 +535,18 @@ while [[ $# -gt 0 ]]; do
       AGENT_AUTH_TOKEN=${2:-}
       shift 2
       ;;
+    --agent-key)
+      AGENT_KEY=${2:-}
+      shift 2
+      ;;
+    --agent-key-file)
+      AGENT_KEY_FILE=${2:-}
+      shift 2
+      ;;
+    --edge)
+      EDGE_CANDIDATES_RAW+="${EDGE_CANDIDATES_RAW:+,}${2:-}"
+      shift 2
+      ;;
     --node-name)
       NODE_NAME=${2:-}
       shift 2
@@ -532,6 +557,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --group-id)
       NODE_GROUP_ID=${2:-}
+      shift 2
+      ;;
+    --tunnel-group)
+      TUNNEL_GROUP_ID=${2:-}
       shift 2
       ;;
     -h|--help)
@@ -574,6 +603,9 @@ if [[ -z $NODE_ID ]]; then
   echo "[anyproxy-install] generated node id: ${NODE_ID}"
 fi
 
+EDGE_STATUS_FILE="${ANYPROXY_STATUS_FILE:-/var/lib/anyproxy/edge-status-${NODE_ID}.env}"
+mkdir -p "$(dirname "$EDGE_STATUS_FILE")"
+
 if [[ "$NODE_TYPE" != "edge" && "$NODE_TYPE" != "tunnel" ]]; then
   echo "[anyproxy-install] --type must be either edge or tunnel" >&2
   exit 1
@@ -590,6 +622,15 @@ esac
 
 CONTROL_PLANE_URL=${CONTROL_PLANE_URL%/}
 
+EDGE_CANDIDATES=()
+if [[ -n $EDGE_CANDIDATES_RAW ]]; then
+  IFS=',' read -ra EDGE_CANDIDATES <<<"${EDGE_CANDIDATES_RAW}"
+fi
+
+if [[ -z $TUNNEL_GROUP_ID ]]; then
+  TUNNEL_GROUP_ID=$NODE_GROUP_ID
+fi
+
 if [[ "$NODE_TYPE" == "edge" ]]; then
   install_openresty
   install_haproxy_pkg
@@ -600,6 +641,12 @@ cleanup() {
   rm -rf "$TMPDIR"
 }
 trap cleanup EXIT
+
+quote_var() {
+  local key=$1
+  local value=${2-}
+  printf 'export %s=%q\n' "$key" "$value"
+}
 
 download_agent() {
   local agent_type=$1
@@ -648,18 +695,101 @@ write_service() {
   } >"$service_path"
 }
 
+install_edgectl_cli() {
+  local url="${CONTROL_PLANE_URL}/install/edgectl.sh"
+  if ! curl -fsSL "$url" -o "$EDGECTL_BIN_PATH"; then
+    log_warn "下载 edgectl 失败：${url}"
+    return
+  fi
+  chmod 0755 "$EDGECTL_BIN_PATH"
+  log_info "edgectl 安装到 ${EDGECTL_BIN_PATH}"
+}
+
+write_edgectl_state() {
+  local state_dir
+  state_dir=$(dirname "$EDGECTL_STATE_FILE")
+  mkdir -p "$state_dir"
+  local install_url="${CONTROL_PLANE_URL}/install/edge-install.sh"
+  local uninstall_url="${CONTROL_PLANE_URL}/install/edge-uninstall.sh"
+  {
+    echo "# 自动生成，请勿手动修改"
+    quote_var "ANYPROXY_CONTROL_PLANE" "$CONTROL_PLANE_URL"
+    quote_var "ANYPROXY_NODE_TYPE" "$NODE_TYPE"
+    quote_var "ANYPROXY_NODE_ID" "$NODE_ID"
+    quote_var "ANYPROXY_NODE_NAME" "$NODE_NAME"
+    quote_var "ANYPROXY_NODE_CATEGORY" "$NODE_CATEGORY"
+    quote_var "ANYPROXY_NODE_GROUP_ID" "$NODE_GROUP_ID"
+    quote_var "ANYPROXY_VERSION" "$VERSION"
+    quote_var "ANYPROXY_RELOAD_CMD" "$RELOAD_CMD"
+    quote_var "ANYPROXY_OUTPUT_PATH" "$OUTPUT_PATH"
+    quote_var "ANYPROXY_STREAM_OUTPUT_PATH" "$STREAM_OUTPUT_PATH"
+    quote_var "ANYPROXY_HAPROXY_RELOAD_CMD" "$HAPROXY_RELOAD_CMD"
+    quote_var "ANYPROXY_CERT_DIR" "$CERT_DIR"
+    quote_var "ANYPROXY_CLIENT_CA_DIR" "$CLIENT_CA_DIR"
+    quote_var "ANYPROXY_AGENT_TOKEN" "$AGENT_AUTH_TOKEN"
+    quote_var "ANYPROXY_AGENT_VERSION" "$AGENT_VERSION"
+    quote_var "ANYPROXY_EDGE_CANDIDATES" "$EDGE_CANDIDATES_RAW"
+    quote_var "ANYPROXY_STATUS_FILE" "$EDGE_STATUS_FILE"
+    quote_var "EDGE_STATE_SERVICE_NAME" "$EDGE_SERVICE_NAME"
+    quote_var "EDGE_STATE_INSTALL_URL" "$install_url"
+    quote_var "EDGE_STATE_UNINSTALL_URL" "$uninstall_url"
+    quote_var "EDGE_STATE_BIN_PATH" "$EDGECTL_BIN_PATH"
+    quote_var "EDGE_STATE_STATUS_FILE" "$EDGE_STATUS_FILE"
+  } >"$EDGECTL_STATE_FILE"
+  chmod 600 "$EDGECTL_STATE_FILE"
+  log_info "edgectl 状态写入 ${EDGECTL_STATE_FILE}"
+}
+
+cleanup_service_unit() {
+  local service_name=$1
+  local service_path="/etc/systemd/system/${service_name}"
+
+  if [[ -z "$service_name" ]]; then
+    return
+  fi
+
+  if systemctl list-unit-files "${service_name}" >/dev/null 2>&1 || [[ -f "$service_path" ]]; then
+    log_info "stopping and removing legacy unit ${service_name}"
+    systemctl stop "${service_name}" >/dev/null 2>&1 || true
+    systemctl disable "${service_name}" >/dev/null 2>&1 || true
+    rm -f "${service_path}"
+    rm -rf "${service_path}.d"
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl reset-failed "${service_name}" >/dev/null 2>&1 || true
+  fi
+}
+
+cleanup_binary_artifact() {
+  local binary_path=$1
+  if [[ -n "$binary_path" && -e "$binary_path" ]]; then
+    log_info "removing legacy binary ${binary_path}"
+    rm -f "$binary_path"
+  fi
+}
+
 SERVICES=()
 
 if [[ "$NODE_TYPE" == "edge" ]]; then
+  EDGE_SERVICE_NAME="anyproxy-edge-${NODE_ID}.service"
+  EDGE_INSTALL_PATH="/usr/local/bin/anyproxy-edge"
+  cleanup_service_unit "$EDGE_SERVICE_NAME"
+  cleanup_service_unit "anyproxy-edge.service"
+  cleanup_binary_artifact "$EDGE_INSTALL_PATH"
+
   download_agent "edge"
 
-  EDGE_INSTALL_PATH="/usr/local/bin/anyproxy-edge"
   echo "[anyproxy-install] installing binary to ${EDGE_INSTALL_PATH}"
   install -m 0755 "${TMPDIR}/edge-agent" "$EDGE_INSTALL_PATH"
 
   EDGE_DEFAULT_OUTPUT="/etc/nginx/conf.d/anyproxy-${NODE_ID}.conf"
   EDGE_OUTPUT_PATH=${OUTPUT_PATH:-$EDGE_DEFAULT_OUTPUT}
   mkdir -p "$(dirname "$EDGE_OUTPUT_PATH")"
+  EDGE_KEY_PATH="/etc/anyproxy/.anyproxy-node.key"
+
+  if [[ -n $AGENT_AUTH_TOKEN && -f $EDGE_KEY_PATH ]]; then
+    log_info "removing stale node key ${EDGE_KEY_PATH} before issuing new key"
+    rm -f "$EDGE_KEY_PATH"
+  fi
 
   STREAM_DEFAULT_OUTPUT="/etc/haproxy/haproxy.cfg"
   STREAM_OUTPUT_PATH=${STREAM_OUTPUT_PATH:-$STREAM_DEFAULT_OUTPUT}
@@ -689,12 +819,16 @@ if [[ "$NODE_TYPE" == "edge" ]]; then
   if [[ -n $CLIENT_CA_DIR ]]; then
     EDGE_EXEC_ARGS+=("-client-ca-dir" "${CLIENT_CA_DIR}")
   fi
+  if [[ -n $AGENT_VERSION ]]; then
+    EDGE_EXEC_ARGS+=("-agent-version" "${AGENT_VERSION}")
+  fi
+  EDGE_EXEC_ARGS+=("-node-key-path" "${EDGE_KEY_PATH}")
+  EDGE_EXEC_ARGS+=("-status-file" "${EDGE_STATUS_FILE}")
   EDGE_EXEC_ARGS+=("-reload" "${RELOAD_CMD}")
   if [[ -n $HAPROXY_RELOAD_CMD ]]; then
     EDGE_EXEC_ARGS+=("-haproxy-reload" "${HAPROXY_RELOAD_CMD}")
   fi
 
-  EDGE_SERVICE_NAME="anyproxy-edge-${NODE_ID}.service"
   EDGE_SERVICE_PATH="/etc/systemd/system/${EDGE_SERVICE_NAME}"
   write_service "$EDGE_SERVICE_PATH" "AnyProxy edge agent (${NODE_ID})" "$EDGE_INSTALL_PATH" "${EDGE_EXEC_ARGS[@]}"
   echo "[anyproxy-install] systemd unit written to ${EDGE_SERVICE_PATH}"
@@ -709,28 +843,50 @@ if [[ "$NODE_TYPE" == "edge" ]]; then
   echo "[anyproxy-install] installation complete."
   echo "[anyproxy-install] HTTP config renders to ${EDGE_OUTPUT_PATH}"
   echo "[anyproxy-install] Stream config renders to ${STREAM_OUTPUT_PATH}"
+
+  install_edgectl_cli
+  write_edgectl_state
 elif [[ "$NODE_TYPE" == "tunnel" ]]; then
+  TUNNEL_SERVICE_NAME="anyproxy-tunnel-${NODE_ID}.service"
+  TUNNEL_INSTALL_PATH="/usr/local/bin/anyproxy-tunnel"
+  cleanup_service_unit "$TUNNEL_SERVICE_NAME"
+  cleanup_service_unit "anyproxy-tunnel.service"
+  cleanup_binary_artifact "$TUNNEL_INSTALL_PATH"
+
   download_agent "tunnel"
 
-  TUNNEL_INSTALL_PATH="/usr/local/bin/anyproxy-tunnel"
   echo "[anyproxy-install] installing binary to ${TUNNEL_INSTALL_PATH}"
   install -m 0755 "${TMPDIR}/tunnel-agent" "$TUNNEL_INSTALL_PATH"
 
-  TUNNEL_DEFAULT_OUTPUT="/etc/nginx/stream.d/anyproxy-${NODE_ID}.conf"
-  TUNNEL_OUTPUT_PATH=${STREAM_OUTPUT_PATH:-${OUTPUT_PATH:-$TUNNEL_DEFAULT_OUTPUT}}
-  mkdir -p "$(dirname "$TUNNEL_OUTPUT_PATH")"
+  if [[ -z $AGENT_KEY && -z $AGENT_KEY_FILE ]]; then
+    echo "[anyproxy-install] ANYPROXY_AGENT_KEY or --agent-key is required for tunnel nodes" >&2
+    exit 1
+  fi
+
+  KEY_FILE_PATH="$AGENT_KEY_FILE"
+  if [[ -z $KEY_FILE_PATH ]]; then
+    KEY_FILE_PATH="/etc/anyproxy/tunnel-agent.key"
+    mkdir -p "$(dirname "$KEY_FILE_PATH")"
+    printf '%s\n' "$AGENT_KEY" >"$KEY_FILE_PATH"
+    chmod 600 "$KEY_FILE_PATH"
+  fi
 
   TUNNEL_EXEC_ARGS=(
     "-control-plane" "${CONTROL_PLANE_URL}"
     "-node-id" "${NODE_ID}"
-    "-output" "${TUNNEL_OUTPUT_PATH}"
+    "-agent-key-file" "${KEY_FILE_PATH}"
   )
-  if [[ -n $AGENT_AUTH_TOKEN ]]; then
-    TUNNEL_EXEC_ARGS+=("-auth-token" "${AGENT_AUTH_TOKEN}")
+  if [[ -n $TUNNEL_GROUP_ID ]]; then
+    TUNNEL_EXEC_ARGS+=("-group-id" "${TUNNEL_GROUP_ID}")
   fi
-  TUNNEL_EXEC_ARGS+=("-reload" "${RELOAD_CMD}")
+  for edge in "${EDGE_CANDIDATES[@]}"; do
+    edge="$(echo "$edge" | xargs)"
+    if [[ -z $edge ]]; then
+      continue
+    fi
+    TUNNEL_EXEC_ARGS+=("-edge" "$edge")
+  done
 
-  TUNNEL_SERVICE_NAME="anyproxy-tunnel-${NODE_ID}.service"
   TUNNEL_SERVICE_PATH="/etc/systemd/system/${TUNNEL_SERVICE_NAME}"
   write_service "$TUNNEL_SERVICE_PATH" "AnyProxy tunnel agent (${NODE_ID})" "$TUNNEL_INSTALL_PATH" "${TUNNEL_EXEC_ARGS[@]}"
   echo "[anyproxy-install] systemd unit written to ${TUNNEL_SERVICE_PATH}"
@@ -739,7 +895,7 @@ elif [[ "$NODE_TYPE" == "tunnel" ]]; then
   systemctl enable --now "$TUNNEL_SERVICE_NAME"
   systemctl status "$TUNNEL_SERVICE_NAME" --no-pager
 
-  echo "[anyproxy-install] installation complete. Stream config renders to ${TUNNEL_OUTPUT_PATH}"
+  echo "[anyproxy-install] installation complete. Tunnel client running"
 else
   echo "[anyproxy-install] unsupported node type: ${NODE_TYPE}" >&2
   exit 1

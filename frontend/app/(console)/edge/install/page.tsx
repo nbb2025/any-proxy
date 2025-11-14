@@ -21,6 +21,7 @@ type InstallResponse = {
   groupId: string | null
   agentToken: string | null
   autoGeneratesNodeId: boolean
+  uninstallCommand: string
 }
 
 const SUPPORTED_OS_GROUPS: { title: string; entries: string[] }[] = [
@@ -65,6 +66,7 @@ export default function EdgeInstallPage() {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [copyState, setCopyState] = useState<"idle" | "copied">("idle")
+  const [uninstallCopyState, setUninstallCopyState] = useState<"idle" | "copied">("idle")
 
   useEffect(() => {
     const loadGroups = async () => {
@@ -108,6 +110,12 @@ export default function EdgeInstallPage() {
     const timer = setTimeout(() => setCopyState("idle"), 2200)
     return () => clearTimeout(timer)
   }, [copyState])
+
+  useEffect(() => {
+    if (uninstallCopyState !== "copied") return
+    const timer = setTimeout(() => setUninstallCopyState("idle"), 2200)
+    return () => clearTimeout(timer)
+  }, [uninstallCopyState])
 
   const generateCommand = useCallback(
     async (copyAfter = false) => {
@@ -185,6 +193,21 @@ export default function EdgeInstallPage() {
       setCopyState("copied")
     } catch {
       setError("复制失败，请手动复制命令")
+    }
+  }, [response])
+
+
+  const handleCopyUninstall = useCallback(async () => {
+    if (!response?.uninstallCommand) return
+    if (typeof navigator === "undefined" || !navigator.clipboard) {
+      setError("当前环境不支持自动复制，请手动复制卸载命令")
+      return
+    }
+    try {
+      await navigator.clipboard.writeText(response.uninstallCommand)
+      setUninstallCopyState("copied")
+    } catch {
+      setError("复制失败，请手动复制卸载命令")
     }
   }, [response])
 
@@ -424,6 +447,35 @@ export default function EdgeInstallPage() {
               </div>
             ) : null}
 
+            {response?.uninstallCommand ? (
+              <div className="space-y-2 rounded-md border border-dashed border-border/60 p-3">
+                <div className="flex items-center justify-between">
+                  <p className="text-sm font-semibold text-foreground">卸载命令</p>
+                  <Button variant="outline" size="sm" onClick={handleCopyUninstall} disabled={!canCopy}>
+                    {uninstallCopyState === "copied" ? (
+                      <>
+                        <Check className="mr-2 h-4 w-4" />
+                        已复制
+                      </>
+                    ) : (
+                      <>
+                        <Copy className="mr-2 h-4 w-4" />
+                        复制命令
+                      </>
+                    )}
+                  </Button>
+                </div>
+                <Textarea
+                  className="min-h-24 bg-muted/40 font-mono text-sm"
+                  value={response.uninstallCommand}
+                  readOnly
+                />
+                {!response.nodeId ? (
+                  <p className="text-xs text-muted-foreground">执行前请将 ANYPROXY_NODE_ID 替换为实际的节点 ID。</p>
+                ) : null}
+              </div>
+            ) : null}
+
             {error && (
               <p className="flex items-center gap-2 text-sm text-destructive">
                 <AlertCircle className="h-4 w-4" />
@@ -448,16 +500,12 @@ export default function EdgeInstallPage() {
 
           <ul className="ml-12 list-disc space-y-2 text-sm text-muted-foreground">
             <li>
-              脚本会生成 <code>{`anyproxy-edge-${response?.nodeId ?? "<自动生成的节点ID>"}.service`}</code>{" "}
-              与{" "}
-              <code>{`anyproxy-tunnel-${response?.nodeId ?? "<自动生成的节点ID>"}.service`}</code>，确保服务状态为 active。
+              脚本会生成 <code>{`anyproxy-edge-${response?.nodeId ?? "<自动生成的节点ID>"}.service`}</code>{" "}systemd 服务，确保状态为 active。
             </li>
             <li>
-              如需卸载，可执行{" "}
-              <code>{`sudo systemctl disable --now anyproxy-edge-${response?.nodeId ?? "<自动生成的节点ID>"}`}</code>{" "}
-              与{" "}
-              <code>{`sudo systemctl disable --now anyproxy-tunnel-${response?.nodeId ?? "<自动生成的节点ID>"}`}</code>{" "}
-              并删除对应配置文件。
+              如需卸载，可执行上方提供的卸载命令（edge-uninstall.sh），或在节点上运行
+              {" "}
+              <code>sudo edgectl uninstall</code>（安装脚本会自动安装 edgectl 并保存参数）。
             </li>
             <li>
               建议为生产节点配置监控：systemd 服务存活、`/var/log/` 中的 agent 日志、OpenResty/Haproxy 状态等指标。

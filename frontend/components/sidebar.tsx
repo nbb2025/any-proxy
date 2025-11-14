@@ -4,12 +4,12 @@ import Link from "next/link"
 import { usePathname, useRouter } from "next/navigation"
 import { cn } from "@/lib/utils"
 import { clearAuthTokens } from "@/lib/auth.client"
-import { LayoutDashboard, Network, Database, Shield, Settings, Globe, LogOut } from "lucide-react"
+import { LayoutDashboard, Network, Shield, Settings, Globe, LogOut, Share2 } from "lucide-react"
 
 const navigation = [
   { name: "仪表盘", href: "/", icon: LayoutDashboard },
   { name: "边缘节点", href: "/edge", icon: Network },
-  { name: "域名上游", href: "/resources", icon: Database },
+  { name: "代理管理", href: "/resources", icon: Share2 },
   { name: "策略中心", href: "/policy", icon: Shield },
   { name: "系统设置", href: "/settings", icon: Settings },
 ]

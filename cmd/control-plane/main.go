@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -20,6 +21,8 @@ import (
 	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
+	"gorm.io/driver/postgres"
+	"gorm.io/gorm"
 
 	installassets "anyproxy.dev/any-proxy"
 	"anyproxy.dev/any-proxy/internal/api"
@@ -42,6 +45,10 @@ func main() {
 		etcdKeyPath     = flag.String("etcd-key", "", "Client TLS key file for etcd")
 		etcdCAPath      = flag.String("etcd-ca", "", "CA bundle for verifying etcd server certificates")
 		etcdSkipVerify  = flag.Bool("etcd-insecure-skip-verify", false, "Skip TLS certificate verification for etcd (NOT recommended)")
+		pgDSN           = flag.String("pg-dsn", "", "PostgreSQL DSN for management-plane data")
+		pgMaxIdle       = flag.Int("pg-max-idle", 4, "Max idle Postgres connections")
+		pgMaxOpen       = flag.Int("pg-max-open", 16, "Max open Postgres connections")
+		pgConnLifetime  = flag.Duration("pg-conn-max-lifetime", 2*time.Hour, "Max lifetime for Postgres connections")
 	)
 	flag.Parse()
 
@@ -50,53 +57,102 @@ func main() {
 	var (
 		store      configstore.Store
 		etcdClient *clientv3.Client
+		etcdStore  *configstore.EtcdStore
+		pgDB       *gorm.DB
 		healthFn   func(context.Context) error
+		healthFns  []func(context.Context) error
 	)
 
-	if endpointsRaw := strings.TrimSpace(*etcdEndpoints); endpointsRaw != "" {
-		endpoints := splitAndClean(endpointsRaw)
-		if len(endpoints) == 0 {
-			logger.Fatalf("etcd endpoints empty after trimming input")
-		}
+	endpointsRaw := strings.TrimSpace(*etcdEndpoints)
+	if endpointsRaw == "" {
+		logger.Fatalf("etcd endpoints are required; set -etcd-endpoints or ETCD_ENDPOINTS")
+	}
+	endpoints := splitAndClean(endpointsRaw)
+	if len(endpoints) == 0 {
+		logger.Fatalf("etcd endpoints empty after trimming input")
+	}
 
-		tlsCfg, err := buildEtcdTLSConfig(*etcdCertPath, *etcdKeyPath, *etcdCAPath, *etcdSkipVerify)
+	tlsCfg, err := buildEtcdTLSConfig(*etcdCertPath, *etcdKeyPath, *etcdCAPath, *etcdSkipVerify)
+	if err != nil {
+		logger.Fatalf("failed to build etcd TLS config: %v", err)
+	}
+
+	cfg := clientv3.Config{
+		Endpoints:   endpoints,
+		DialTimeout: *etcdDialTimeout,
+	}
+	if tlsCfg != nil {
+		cfg.TLS = tlsCfg
+	}
+	if *etcdUsername != "" {
+		cfg.Username = *etcdUsername
+		cfg.Password = *etcdPassword
+	}
+
+	etcdClient, err = clientv3.New(cfg)
+	if err != nil {
+		logger.Fatalf("failed to connect etcd: %v", err)
+	}
+	defer func() {
+		_ = etcdClient.Close()
+	}()
+
+	etcdStore, err = configstore.NewEtcdStore(etcdClient, configstore.EtcdOptions{
+		Prefix:  *etcdPrefix,
+		Timeout: *etcdTimeout,
+	})
+	if err != nil {
+		logger.Fatalf("init etcd store failed: %v", err)
+	}
+
+	store = etcdStore
+	healthFns = append(healthFns, makeEtcdHealthFunc(etcdClient, endpoints, *etcdTimeout))
+	logger.Printf("using etcd store endpoints=%v prefix=%s", endpoints, *etcdPrefix)
+
+	if dsn := strings.TrimSpace(*pgDSN); dsn != "" {
+		if etcdStore == nil {
+			logger.Fatalf("postgres store requires etcd endpoints; set -etcd-endpoints")
+		}
+		var err error
+		pgDB, err = gorm.Open(postgres.Open(dsn), &gorm.Config{})
 		if err != nil {
-			logger.Fatalf("failed to build etcd TLS config: %v", err)
+			logger.Fatalf("postgres connection failed: %v", err)
 		}
-
-		cfg := clientv3.Config{
-			Endpoints:   endpoints,
-			DialTimeout: *etcdDialTimeout,
-		}
-		if tlsCfg != nil {
-			cfg.TLS = tlsCfg
-		}
-		if *etcdUsername != "" {
-			cfg.Username = *etcdUsername
-			cfg.Password = *etcdPassword
-		}
-
-		etcdClient, err = clientv3.New(cfg)
+		sqlDB, err := pgDB.DB()
 		if err != nil {
-			logger.Fatalf("failed to connect etcd: %v", err)
+			logger.Fatalf("postgres driver unwrap failed: %v", err)
 		}
-		defer func() {
-			_ = etcdClient.Close()
-		}()
+		sqlDB.SetMaxIdleConns(*pgMaxIdle)
+		sqlDB.SetMaxOpenConns(*pgMaxOpen)
+		sqlDB.SetConnMaxLifetime(*pgConnLifetime)
+		defer func(db *sql.DB) {
+			_ = db.Close()
+		}(sqlDB)
 
-		store, err = configstore.NewEtcdStore(etcdClient, configstore.EtcdOptions{
-			Prefix:  *etcdPrefix,
-			Timeout: *etcdTimeout,
-		})
+		mgmtStore, err := configstore.NewPGStore(pgDB)
 		if err != nil {
-			logger.Fatalf("init etcd store failed: %v", err)
+			logger.Fatalf("init pg store failed: %v", err)
 		}
+		hybridStore, err := configstore.NewHybridStore(etcdStore, mgmtStore)
+		if err != nil {
+			logger.Fatalf("init hybrid store failed: %v", err)
+		}
+		store = hybridStore
+		healthFns = append(healthFns, makePGHealthFunc(pgDB))
+		logger.Printf("using hybrid store etcd-prefix=%s pg=%s", *etcdPrefix, sanitizeDSN(dsn))
+	}
 
-		healthFn = makeEtcdHealthFunc(etcdClient, endpoints, *etcdTimeout)
-		logger.Printf("using etcd store endpoints=%v prefix=%s", endpoints, *etcdPrefix)
-	} else {
-		store = configstore.NewMemoryStore()
-		logger.Printf("using in-memory store (data resets on restart)")
+	if len(healthFns) == 1 {
+		healthFn = healthFns[0]
+	} else if len(healthFns) > 1 {
+		healthFn = func(ctx context.Context) error {
+			for _, fn := range healthFns {
+				if err := fn(ctx); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
 	}
 
 	if *seedPath != "" {
@@ -106,9 +162,15 @@ func main() {
 		logger.Printf("seed configuration loaded from %s", *seedPath)
 	}
 
+	installDir := detectInstallAssetsDir()
+	versionLister := newAgentVersionLister(logger, installDir)
+
 	opts := []api.Option{api.WithLogger(logger)}
 	if healthFn != nil {
 		opts = append(opts, api.WithHealthCheck(healthFn))
+	}
+	if versionLister != nil {
+		opts = append(opts, api.WithAgentVersionLister(versionLister))
 	}
 	apiServer := api.NewServer(store, opts...)
 
@@ -125,7 +187,7 @@ func main() {
 	apiServer.Register(protectedMux)
 
 	rootMux := http.NewServeMux()
-	installFS := http.FS(newInstallFS(logger))
+	installFS := http.FS(newInstallFS(logger, installDir))
 	installHandler := http.StripPrefix("/install/", http.FileServer(installFS))
 	rootMux.Handle("/install/", withNoStore(installHandler))
 	rootMux.Handle("/install", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -134,6 +196,7 @@ func main() {
 	rootMux.Handle("/auth/login", auth.LoginHandler(authMgr))
 	rootMux.Handle("/auth/refresh", auth.RefreshHandler(authMgr))
 
+	nodeKeyValidator := &nodeKeyValidator{store: store}
 	authenticatedHandler := auth.Middleware(
 		protectedMux,
 		authMgr,
@@ -141,6 +204,11 @@ func main() {
 		auth.WithSkip("GET", "/install/"),
 		auth.WithSkip("GET", "/install/*"),
 		auth.WithSkip("GET", "/agent/healthz"),
+		auth.WithNodeKeyValidator(
+			nodeKeyValidator,
+			"GET /v1/config/snapshot",
+			"POST /v1/nodes/register",
+		),
 	)
 	rootMux.Handle("/", authenticatedHandler)
 
@@ -180,9 +248,8 @@ func withNoStore(next http.Handler) http.Handler {
 	})
 }
 
-func newInstallFS(logger *log.Logger) fs.FS {
+func newInstallFS(logger *log.Logger, diskDir string) fs.FS {
 	embedded := installassets.FS()
-	diskDir := detectInstallAssetsDir()
 	if diskDir == "" {
 		logger.Printf("serving installer assets from embedded bundle only")
 		return embedded
@@ -219,6 +286,39 @@ func detectInstallAssetsDir() string {
 		}
 	}
 	return ""
+}
+
+type nodeKeyValidator struct {
+	store configstore.Store
+}
+
+func (v *nodeKeyValidator) ValidateNodeKey(ctx context.Context, nodeID, secret string) error {
+	if v == nil || v.store == nil {
+		return fmt.Errorf("node key validator not initialised")
+	}
+	id := strings.TrimSpace(nodeID)
+	key := strings.TrimSpace(secret)
+	if id == "" || key == "" {
+		return auth.ErrInvalidNodeKey
+	}
+	snap, err := v.store.Snapshot(ctx)
+	if err != nil {
+		return err
+	}
+	for _, node := range snap.Nodes {
+		if node.ID != id {
+			continue
+		}
+		hash := strings.TrimSpace(node.NodeKeyHash)
+		if hash == "" {
+			return auth.ErrInvalidNodeKey
+		}
+		if configstore.HashNodeKey(key) != hash {
+			return auth.ErrInvalidNodeKey
+		}
+		return nil
+	}
+	return auth.ErrInvalidNodeKey
 }
 
 type compositeInstallFS struct {
@@ -296,8 +396,10 @@ func loadSeed(store configstore.Store, path string) error {
 	}
 
 	var seed struct {
-		Domains []configstore.DomainRoute `json:"domains"`
-		Tunnels []configstore.TunnelRoute `json:"tunnels"`
+		Domains      []configstore.DomainRoute `json:"domains"`
+		Tunnels      []configstore.TunnelRoute `json:"tunnels"`
+		TunnelGroups []configstore.TunnelGroup `json:"tunnelGroups"`
+		TunnelAgents []configstore.TunnelAgent `json:"tunnelAgents"`
 	}
 	if err := json.Unmarshal(payload, &seed); err != nil {
 		return err
@@ -310,6 +412,16 @@ func loadSeed(store configstore.Store, path string) error {
 	}
 	for _, t := range seed.Tunnels {
 		if _, err := store.UpsertTunnel(t); err != nil {
+			return err
+		}
+	}
+	for _, group := range seed.TunnelGroups {
+		if _, _, err := store.UpsertTunnelGroup(group); err != nil {
+			return err
+		}
+	}
+	for _, agent := range seed.TunnelAgents {
+		if _, _, err := store.UpsertTunnelAgent(agent); err != nil {
 			return err
 		}
 	}
@@ -377,6 +489,23 @@ func makeEtcdHealthFunc(cli *clientv3.Client, endpoints []string, timeout time.D
 		}
 		return nil
 	}
+}
+
+func makePGHealthFunc(db *gorm.DB) func(context.Context) error {
+	return func(ctx context.Context) error {
+		sqlDB, err := db.DB()
+		if err != nil {
+			return err
+		}
+		return sqlDB.PingContext(ctx)
+	}
+}
+
+func sanitizeDSN(dsn string) string {
+	if i := strings.LastIndex(dsn, "@"); i >= 0 {
+		return "***" + dsn[i:]
+	}
+	return dsn
 }
 
 func loggingMiddleware(logger *log.Logger, next http.Handler) http.Handler {

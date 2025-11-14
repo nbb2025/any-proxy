@@ -21,22 +21,32 @@ var edgeFuncMap = template.FuncMap{
 	"tlsProtocols":   tlsProtocols,
 }
 
-// RenderEdge writes the rendered HTTP config to disk.
-func RenderEdge(data EdgeTemplateData, outputPath string, templatePath string) error {
+// RenderEdge writes the rendered HTTP config to disk and reports whether the file changed.
+func RenderEdge(data EdgeTemplateData, outputPath string, templatePath string) (bool, error) {
 	tpl, err := loadTemplate("edge", edgeTemplate, templatePath, edgeFuncMap)
 	if err != nil {
-		return fmt.Errorf("load template: %w", err)
+		return false, fmt.Errorf("load template: %w", err)
 	}
 
 	var buf bytes.Buffer
 	if err := tpl.Execute(&buf, data); err != nil {
-		return fmt.Errorf("execute template: %w", err)
+		return false, fmt.Errorf("execute template: %w", err)
 	}
 
-	if err := os.WriteFile(outputPath, buf.Bytes(), 0o644); err != nil {
-		return fmt.Errorf("write output: %w", err)
+	newBytes := buf.Bytes()
+	existing, err := os.ReadFile(outputPath)
+	if err == nil {
+		if bytes.Equal(existing, newBytes) {
+			return false, os.Chmod(outputPath, 0o644)
+		}
+	} else if !os.IsNotExist(err) {
+		return false, fmt.Errorf("read output: %w", err)
 	}
-	return nil
+
+	if err := os.WriteFile(outputPath, newBytes, 0o644); err != nil {
+		return false, fmt.Errorf("write output: %w", err)
+	}
+	return true, nil
 }
 
 func certificateFor(certs map[string]CertificateMaterial, accountID string) *CertificateMaterial {

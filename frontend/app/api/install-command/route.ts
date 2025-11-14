@@ -26,7 +26,6 @@ export async function POST(request: Request) {
   const nodeName = payload.nodeName?.trim()
   const nodeCategory = payload.nodeCategory?.trim()
   const groupId = payload.groupId?.trim()
-  const agentToken = payload.agentToken?.trim()
 
   if (requestedType && requestedType !== "edge" && requestedType !== "tunnel") {
     return NextResponse.json({ error: "nodeType must be edge or tunnel" }, { status: 400 })
@@ -42,6 +41,9 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "unauthorized" }, { status: 401 })
   }
 
+  const providedAgentToken = payload.agentToken?.trim()
+  const agentToken = providedAgentToken && providedAgentToken.length > 0 ? providedAgentToken : accessToken
+
   let controlPlaneUrl = payload.controlPlaneUrl?.trim() ?? process.env.INSTALL_CONTROL_PLANE_URL ?? ""
 
   if (!controlPlaneUrl) {
@@ -50,7 +52,9 @@ export async function POST(request: Request) {
     controlPlaneUrl = host ? `${proto}://${host}` : getControlPlaneURL() ?? ""
   }
 
-  const installUrl = `${controlPlaneUrl.replace(/\/$/, "")}/install/edge-install.sh`
+  const normalizedBase = controlPlaneUrl.replace(/\/$/, "")
+  const installUrl = `${normalizedBase}/install/edge-install.sh`
+  const uninstallUrl = `${normalizedBase}/install/edge-uninstall.sh`
 
   const envVars: string[] = [
     `ANYPROXY_CONTROL_PLANE=${shellEscape(controlPlaneUrl)}`,
@@ -64,6 +68,11 @@ export async function POST(request: Request) {
   if (agentToken) envVars.push(`ANYPROXY_AGENT_TOKEN=${shellEscape(agentToken)}`)
 
   const command = `curl -fsSL ${installUrl} | sudo ${envVars.join(" ")} bash`
+  const uninstallEnv: string[] = [
+    `ANYPROXY_NODE_TYPE=${shellEscape(nodeType)}`,
+    nodeId ? `ANYPROXY_NODE_ID=${shellEscape(nodeId)}` : "ANYPROXY_NODE_ID=<节点ID>",
+  ]
+  const uninstallCommand = `curl -fsSL ${uninstallUrl} | sudo ${uninstallEnv.join(" ")} bash`
 
   return NextResponse.json({
     command,
@@ -74,6 +83,7 @@ export async function POST(request: Request) {
     nodeCategory: nodeCategory || null,
     groupId: groupId || null,
     agentToken: agentToken || null,
+    uninstallCommand,
     autoGeneratesNodeId: !nodeId,
   })
 }

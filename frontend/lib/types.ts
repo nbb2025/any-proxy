@@ -12,6 +12,18 @@ export interface RouteMeta {
   timeoutProxy?: number
   timeoutRead?: number
   timeoutSend?: number
+  displayName?: string
+  groupName?: string
+  remark?: string
+  forwardMode?: string
+  loadBalancingAlgorithm?: string
+  inboundListeners?: RouteListener[]
+  outboundListeners?: RouteListener[]
+}
+
+export interface RouteListener {
+  protocol: string
+  port?: number
 }
 
 export interface DomainRoute {
@@ -31,13 +43,50 @@ export interface TunnelMeta {
 
 export interface TunnelRoute {
   id: string
+  groupId: string
   protocol: string
   bindHost: string
   bindPort: number
+  bridgeBind?: string
+  bridgePort?: number
   target: string
   nodeIds: string[]
   idleTimeout?: number
   metadata?: TunnelMeta
+  updatedAt?: string
+}
+
+export interface TunnelGroup {
+  id: string
+  name: string
+  description?: string
+  listenAddress: string
+  edgeNodeIds: string[]
+  transports: string[]
+  enableCompress?: boolean
+  createdAt?: string
+  updatedAt?: string
+}
+
+export interface TunnelAgentService {
+  id: string
+  protocol: string
+  localAddress: string
+  localPort: number
+  remotePort: number
+  enableCompression?: boolean
+  description?: string
+}
+
+export interface TunnelAgent {
+  id: string
+  nodeId: string
+  groupId: string
+  description?: string
+  keyVersion: number
+  enabled: boolean
+  services: TunnelAgentService[]
+  createdAt?: string
   updatedAt?: string
 }
 
@@ -165,9 +214,13 @@ export interface EdgeNode {
   groupId: string
   category: NodeCategory
   kind: string
+  name?: string
   hostname?: string
   addresses: string[]
   version?: string
+  agentVersion?: string
+  agentDesiredVersion?: string
+  lastUpgradeAt?: string
   lastSeen?: string
   createdAt?: string
   updatedAt?: string

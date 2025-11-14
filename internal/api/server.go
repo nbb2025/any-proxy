@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"anyproxy.dev/any-proxy/internal/auth"
 	"anyproxy.dev/any-proxy/internal/configstore"
 )
 
@@ -20,9 +21,10 @@ const (
 
 // Server exposes HTTP endpoints for managing configuration and serving agent requests.
 type Server struct {
-	store  configstore.Store
-	logger Logger
-	health func(context.Context) error
+	store         configstore.Store
+	logger        Logger
+	health        func(context.Context) error
+	versionLister AgentVersionLister
 }
 
 // Logger abstracts the logging dependency to simplify unit testing.
@@ -32,6 +34,14 @@ type Logger interface {
 
 // Option applies configuration to the Server.
 type Option func(*Server)
+
+// AgentVersionLister enumerates available agent versions.
+type AgentVersionLister func(context.Context) (AgentVersionListing, error)
+
+type AgentVersionListing struct {
+	Versions       []string
+	LatestResolved string
+}
 
 // WithLogger overrides the logger.
 func WithLogger(l Logger) Option {
@@ -44,6 +54,13 @@ func WithLogger(l Logger) Option {
 func WithHealthCheck(fn func(context.Context) error) Option {
 	return func(s *Server) {
 		s.health = fn
+	}
+}
+
+// WithAgentVersionLister injects the version provider used by /v1/agent-versions.
+func WithAgentVersionLister(lister AgentVersionLister) Option {
+	return func(s *Server) {
+		s.versionLister = lister
 	}
 }
 
@@ -66,6 +83,7 @@ func (s *Server) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/config/snapshot", s.handleSnapshot)
 	mux.HandleFunc("/v1/nodes/register", s.handleNodeRegister)
 	mux.HandleFunc("/v1/nodes", s.handleNodes)
+	mux.HandleFunc("/v1/nodes/desired-version", s.handleNodeDesiredVersionBatch)
 	mux.HandleFunc("/v1/nodes/", s.handleNodesByID)
 	mux.HandleFunc("/v1/node-groups", s.handleNodeGroups)
 	mux.HandleFunc("/v1/node-groups/", s.handleNodeGroupsByID)
@@ -85,6 +103,7 @@ func (s *Server) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/access-policies/", s.handleAccessPoliciesByID)
 	mux.HandleFunc("/v1/rewrite-rules", s.handleRewriteRules)
 	mux.HandleFunc("/v1/rewrite-rules/", s.handleRewriteRulesByID)
+	mux.HandleFunc("/v1/agent-versions", s.handleAgentVersions)
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
@@ -149,6 +168,26 @@ func (s *Server) handleNodeRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	principal, ok := auth.PrincipalFromContext(r.Context())
+	if !ok {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	shouldProvisionKey := false
+	switch principal.Type {
+	case auth.PrincipalTypeUser:
+		shouldProvisionKey = true
+	case auth.PrincipalTypeNode:
+		if strings.TrimSpace(principal.NodeID) == "" || principal.NodeID != nodeID {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+	default:
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
 	addresses := append([]string(nil), payload.Addresses...)
 	if remote := extractRemoteIP(r.RemoteAddr); remote != "" {
 		addresses = appendUnique(addresses, remote)
@@ -162,14 +201,15 @@ func (s *Server) handleNodeRegister(w http.ResponseWriter, r *http.Request) {
 	}
 
 	reg := configstore.NodeRegistration{
-		ID:        nodeID,
-		Kind:      strings.TrimSpace(payload.Kind),
-		GroupID:   strings.TrimSpace(payload.GroupID),
-		Name:      strings.TrimSpace(payload.Name),
-		Category:  category,
-		Hostname:  strings.TrimSpace(payload.Hostname),
-		Addresses: addresses,
-		Version:   strings.TrimSpace(payload.Version),
+		ID:           nodeID,
+		Kind:         strings.TrimSpace(payload.Kind),
+		GroupID:      strings.TrimSpace(payload.GroupID),
+		Name:         strings.TrimSpace(payload.Name),
+		Category:     category,
+		Hostname:     strings.TrimSpace(payload.Hostname),
+		Addresses:    addresses,
+		Version:      strings.TrimSpace(payload.Version),
+		AgentVersion: strings.TrimSpace(payload.AgentVersion),
 	}
 
 	snap, node, err := s.store.RegisterOrUpdateNode(reg)
@@ -183,10 +223,43 @@ func (s *Server) handleNodeRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{
+	var issuedKey string
+	if shouldProvisionKey && strings.TrimSpace(node.NodeKeyHash) == "" {
+		secret, hash, err := configstore.GenerateNodeKey()
+		if err != nil {
+			http.Error(w, fmt.Sprintf("key generation error: %v", err), http.StatusInternalServerError)
+			return
+		}
+		reg.NodeKeyHash = hash
+		nextVersion := node.NodeKeyVersion
+		if nextVersion <= 0 {
+			nextVersion = 1
+		} else {
+			nextVersion++
+		}
+		reg.NodeKeyVersion = nextVersion
+
+		snap, node, err = s.store.RegisterOrUpdateNode(reg)
+		if err != nil {
+			switch {
+			case errors.Is(err, configstore.ErrInvalidGroup):
+				http.Error(w, err.Error(), http.StatusBadRequest)
+			default:
+				http.Error(w, fmt.Sprintf("store error: %v", err), http.StatusInternalServerError)
+			}
+			return
+		}
+		issuedKey = secret
+	}
+
+	resp := map[string]any{
 		"node":    node,
 		"version": snap.Version,
-	})
+	}
+	if issuedKey != "" {
+		resp["nodeKey"] = issuedKey
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request) {
@@ -222,7 +295,39 @@ func (s *Server) handleNodesByID(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		snap, node, err := s.store.UpdateNodeGroup(id, strings.TrimSpace(payload.GroupID))
+		update := configstore.NodeUpdate{}
+		hasChange := false
+
+		if payload.GroupID != nil {
+			groupVal := strings.TrimSpace(*payload.GroupID)
+			update.GroupID = &groupVal
+			hasChange = true
+		}
+		if payload.Name != nil {
+			nameVal := strings.TrimSpace(*payload.Name)
+			update.Name = &nameVal
+			hasChange = true
+		}
+		if payload.Category != nil {
+			cat, err := parseNodeCategory(*payload.Category)
+			if err != nil {
+				http.Error(w, fmt.Sprintf("invalid category: %v", err), http.StatusBadRequest)
+				return
+			}
+			update.Category = &cat
+			hasChange = true
+		}
+		if payload.AgentDesiredVersion != nil {
+			desired := strings.TrimSpace(*payload.AgentDesiredVersion)
+			update.AgentDesiredVersion = &desired
+			hasChange = true
+		}
+		if !hasChange {
+			http.Error(w, "no changes requested", http.StatusBadRequest)
+			return
+		}
+
+		snap, node, err := s.store.UpdateNode(id, update)
 		if err != nil {
 			switch {
 			case errors.Is(err, configstore.ErrNodeNotFound):
@@ -241,9 +346,77 @@ func (s *Server) handleNodesByID(w http.ResponseWriter, r *http.Request) {
 			"node":    node,
 			"version": snap.Version,
 		})
+	case http.MethodDelete:
+		snap, err := s.store.DeleteNode(id)
+		if err != nil {
+			switch {
+			case errors.Is(err, configstore.ErrNodeNotFound):
+				http.Error(w, "not found", http.StatusNotFound)
+			default:
+				http.Error(w, fmt.Sprintf("store error: %v", err), http.StatusInternalServerError)
+			}
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"version": snap.Version,
+		})
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+func (s *Server) handleNodeDesiredVersionBatch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var payload NodeDesiredVersionBatchPayload
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		http.Error(w, fmt.Sprintf("invalid payload: %v", err), http.StatusBadRequest)
+		return
+	}
+	if len(payload.NodeIDs) == 0 {
+		http.Error(w, "nodeIds required", http.StatusBadRequest)
+		return
+	}
+	if payload.AgentDesiredVersion == nil {
+		http.Error(w, "agentDesiredVersion required", http.StatusBadRequest)
+		return
+	}
+
+	desired := strings.TrimSpace(*payload.AgentDesiredVersion)
+	update := configstore.NodeUpdate{AgentDesiredVersion: &desired}
+
+	updated := make([]configstore.EdgeNode, 0, len(payload.NodeIDs))
+	var version int64
+	for _, rawID := range payload.NodeIDs {
+		id := strings.TrimSpace(rawID)
+		if id == "" {
+			http.Error(w, "node id cannot be empty", http.StatusBadRequest)
+			return
+		}
+		snap, node, err := s.store.UpdateNode(id, update)
+		if err != nil {
+			switch {
+			case errors.Is(err, configstore.ErrNodeNotFound):
+				http.Error(w, fmt.Sprintf("node %s not found", id), http.StatusNotFound)
+			case errors.Is(err, configstore.ErrGroupNotFound):
+				http.Error(w, fmt.Sprintf("group for node %s not found", id), http.StatusNotFound)
+			default:
+				http.Error(w, fmt.Sprintf("update node %s failed: %v", id, err), http.StatusInternalServerError)
+			}
+			return
+		}
+		version = snap.Version
+		updated = append(updated, node)
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"nodes":   updated,
+		"version": version,
+		"updated": len(updated),
+	})
 }
 
 func (s *Server) handleNodeGroups(w http.ResponseWriter, r *http.Request) {
@@ -803,6 +976,28 @@ func (s *Server) handleRewriteRulesByID(w http.ResponseWriter, r *http.Request) 
 	}
 }
 
+func (s *Server) handleAgentVersions(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	listing := AgentVersionListing{Versions: []string{"latest"}}
+	if s.versionLister != nil {
+		result, err := s.versionLister(r.Context())
+		if err != nil {
+			http.Error(w, fmt.Sprintf("list versions failed: %v", err), http.StatusInternalServerError)
+			return
+		}
+		if len(result.Versions) > 0 {
+			listing = result
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"versions": listing.Versions,
+		"latest":   listing.LatestResolved,
+	})
+}
+
 func (s *Server) handleUpsertTunnel(w http.ResponseWriter, r *http.Request) {
 	var payload TunnelPayload
 	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
@@ -1224,18 +1419,27 @@ func findTunnelAgentByID(snap configstore.ConfigSnapshot, id string) *configstor
 }
 
 type NodeRegisterPayload struct {
-	NodeID    string   `json:"nodeId"`
-	Kind      string   `json:"kind,omitempty"`
-	Name      string   `json:"name,omitempty"`
-	Category  string   `json:"category,omitempty"`
-	Hostname  string   `json:"hostname,omitempty"`
-	Addresses []string `json:"addresses,omitempty"`
-	Version   string   `json:"version,omitempty"`
-	GroupID   string   `json:"groupId,omitempty"`
+	NodeID       string   `json:"nodeId"`
+	Kind         string   `json:"kind,omitempty"`
+	Name         string   `json:"name,omitempty"`
+	Category     string   `json:"category,omitempty"`
+	Hostname     string   `json:"hostname,omitempty"`
+	Addresses    []string `json:"addresses,omitempty"`
+	Version      string   `json:"version,omitempty"`
+	AgentVersion string   `json:"agentVersion,omitempty"`
+	GroupID      string   `json:"groupId,omitempty"`
 }
 
 type NodeUpdatePayload struct {
-	GroupID string `json:"groupId"`
+	GroupID             *string `json:"groupId,omitempty"`
+	Name                *string `json:"name,omitempty"`
+	Category            *string `json:"category,omitempty"`
+	AgentDesiredVersion *string `json:"agentDesiredVersion,omitempty"`
+}
+
+type NodeDesiredVersionBatchPayload struct {
+	NodeIDs             []string `json:"nodeIds"`
+	AgentDesiredVersion *string  `json:"agentDesiredVersion"`
 }
 
 // DomainPayload describes the REST payload for domain routes.
@@ -1329,10 +1533,22 @@ func (p UpstreamPayload) toUpstream() (configstore.Upstream, error) {
 
 // RouteMetadataInput allows parsing duration strings from JSON.
 type RouteMetadataInput struct {
-	Sticky       bool   `json:"sticky,omitempty"`
-	TimeoutProxy string `json:"timeoutProxy,omitempty"`
-	TimeoutRead  string `json:"timeoutRead,omitempty"`
-	TimeoutSend  string `json:"timeoutSend,omitempty"`
+	Sticky                 bool                 `json:"sticky,omitempty"`
+	TimeoutProxy           string               `json:"timeoutProxy,omitempty"`
+	TimeoutRead            string               `json:"timeoutRead,omitempty"`
+	TimeoutSend            string               `json:"timeoutSend,omitempty"`
+	DisplayName            string               `json:"displayName,omitempty"`
+	GroupName              string               `json:"groupName,omitempty"`
+	Remark                 string               `json:"remark,omitempty"`
+	ForwardMode            string               `json:"forwardMode,omitempty"`
+	LoadBalancingAlgorithm string               `json:"loadBalancingAlgorithm,omitempty"`
+	InboundListeners       []routeListenerInput `json:"inboundListeners,omitempty"`
+	OutboundListeners      []routeListenerInput `json:"outboundListeners,omitempty"`
+}
+
+type routeListenerInput struct {
+	Protocol string `json:"protocol"`
+	Port     int    `json:"port"`
 }
 
 func (r RouteMetadataInput) toRouteMeta() (configstore.RouteMeta, error) {
@@ -1344,8 +1560,34 @@ func (r RouteMetadataInput) toRouteMeta() (configstore.RouteMeta, error) {
 	}
 
 	var err error
+	parseListeners := func(inputs []routeListenerInput) ([]configstore.RouteListener, error) {
+		if len(inputs) == 0 {
+			return nil, nil
+		}
+		listeners := make([]configstore.RouteListener, 0, len(inputs))
+		for idx, listener := range inputs {
+			protocol := strings.ToUpper(strings.TrimSpace(listener.Protocol))
+			if protocol != "HTTP" && protocol != "HTTPS" {
+				return nil, fmt.Errorf("listener[%d]: protocol must be HTTP or HTTPS", idx)
+			}
+			if listener.Port <= 0 || listener.Port > 65535 {
+				return nil, fmt.Errorf("listener[%d]: port must be between 1-65535", idx)
+			}
+			listeners = append(listeners, configstore.RouteListener{
+				Protocol: protocol,
+				Port:     listener.Port,
+			})
+		}
+		return listeners, nil
+	}
+
 	meta := configstore.RouteMeta{
-		Sticky: r.Sticky,
+		Sticky:                 r.Sticky,
+		DisplayName:            strings.TrimSpace(r.DisplayName),
+		GroupName:              strings.TrimSpace(r.GroupName),
+		Remark:                 strings.TrimSpace(r.Remark),
+		ForwardMode:            strings.TrimSpace(strings.ToLower(r.ForwardMode)),
+		LoadBalancingAlgorithm: strings.TrimSpace(strings.ToLower(r.LoadBalancingAlgorithm)),
 	}
 	if meta.TimeoutProxy, err = parse(r.TimeoutProxy); err != nil {
 		return configstore.RouteMeta{}, fmt.Errorf("timeoutProxy: %w", err)
@@ -1356,6 +1598,12 @@ func (r RouteMetadataInput) toRouteMeta() (configstore.RouteMeta, error) {
 	if meta.TimeoutSend, err = parse(r.TimeoutSend); err != nil {
 		return configstore.RouteMeta{}, fmt.Errorf("timeoutSend: %w", err)
 	}
+	if meta.InboundListeners, err = parseListeners(r.InboundListeners); err != nil {
+		return configstore.RouteMeta{}, fmt.Errorf("inboundListeners: %w", err)
+	}
+	if meta.OutboundListeners, err = parseListeners(r.OutboundListeners); err != nil {
+		return configstore.RouteMeta{}, fmt.Errorf("outboundListeners: %w", err)
+	}
 
 	return meta, nil
 }
@@ -1363,9 +1611,12 @@ func (r RouteMetadataInput) toRouteMeta() (configstore.RouteMeta, error) {
 // TunnelPayload describes the REST payload for tunnel definitions.
 type TunnelPayload struct {
 	ID          string              `json:"id,omitempty"`
+	GroupID     string              `json:"groupId"`
 	Protocol    string              `json:"protocol"`
 	BindHost    string              `json:"bindHost"`
 	BindPort    int                 `json:"bindPort"`
+	BridgeBind  string              `json:"bridgeBind,omitempty"`
+	BridgePort  int                 `json:"bridgePort,omitempty"`
 	Target      string              `json:"target"`
 	NodeIDs     []string            `json:"nodeIds"`
 	IdleTimeout string              `json:"idleTimeout,omitempty"`
@@ -1822,6 +2073,9 @@ func extractRemoteIP(remoteAddr string) string {
 
 // Validate checks the tunnel input.
 func (p TunnelPayload) Validate() error {
+	if strings.TrimSpace(p.GroupID) == "" {
+		return errors.New("groupId is required")
+	}
 	if p.Protocol == "" {
 		return errors.New("protocol is required")
 	}
@@ -1833,6 +2087,9 @@ func (p TunnelPayload) Validate() error {
 	}
 	if p.Target == "" {
 		return errors.New("target is required")
+	}
+	if p.BridgePort < 0 || p.BridgePort > 65535 {
+		return errors.New("bridgePort must be between 0 and 65535")
 	}
 	return nil
 }
@@ -1855,9 +2112,12 @@ func (p TunnelPayload) ToTunnelRoute() (configstore.TunnelRoute, error) {
 
 	return configstore.TunnelRoute{
 		ID:          p.ID,
+		GroupID:     p.GroupID,
 		Protocol:    strings.ToLower(p.Protocol),
 		BindHost:    p.BindHost,
 		BindPort:    p.BindPort,
+		BridgeBind:  p.BridgeBind,
+		BridgePort:  p.BridgePort,
 		Target:      p.Target,
 		NodeIDs:     append([]string(nil), p.NodeIDs...),
 		IdleTimeout: idle,

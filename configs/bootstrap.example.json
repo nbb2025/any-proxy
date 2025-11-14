@@ -27,16 +27,46 @@
   "tunnels": [
     {
       "id": "ssh-demo",
+      "groupId": "tg-default",
       "protocol": "tcp",
       "bindHost": "0.0.0.0",
       "bindPort": 2222,
-      "target": "127.0.0.1:22",
-      "nodeIds": ["tunnel-a", "tunnel-b"],
+      "bridgeBind": "127.0.0.1",
+      "bridgePort": 6200,
+      "target": "home-ssh",
+      "nodeIds": ["edge-a"],
       "idleTimeout": "2m",
       "metadata": {
         "enableProxyProtocol": false,
         "description": "SSH relay"
       }
+    }
+  ],
+  "tunnelGroups": [
+    {
+      "id": "tg-default",
+      "name": "Default Tunnel Edge Group",
+      "listenAddress": "127.0.0.1:4433",
+      "edgeNodeIds": ["edge-a"]
+    }
+  ],
+  "tunnelAgents": [
+    {
+      "id": "agent-home",
+      "nodeId": "home-tunnel-node",
+      "groupId": "tg-default",
+      "keyHash": "490096647c1a035bace3c297f23fc92af04ae4c9750145dc893b34f2038acc6a",
+      "keyVersion": 1,
+      "enabled": true,
+      "services": [
+        {
+          "id": "home-ssh",
+          "protocol": "tcp",
+          "localAddress": "127.0.0.1",
+          "localPort": 22,
+          "remotePort": 2222
+        }
+      ]
     }
   ]
 }

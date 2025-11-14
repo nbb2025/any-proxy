@@ -5,7 +5,7 @@ import (
 	"io/fs"
 )
 
-//go:embed install/edge-install.sh
+//go:embed install/edge-install.sh install/edge-uninstall.sh install/edgectl.sh
 var files embed.FS
 
 // FS returns the embedded installer file set.

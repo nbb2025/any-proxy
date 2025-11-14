@@ -27,6 +27,7 @@ const (
 	rewriteRulesDir   = "rewrite_rules/"
 	nodeGroupsDir     = "node_groups/"
 	nodesDir          = "nodes/"
+	metaDir           = "meta/"
 )
 
 // EtcdOptions configures EtcdStore behaviour.
@@ -511,8 +512,29 @@ func (e *EtcdStore) RegisterOrUpdateNode(reg NodeRegistration) (ConfigSnapshot, 
 	if ver := strings.TrimSpace(reg.Version); ver != "" {
 		node.Version = ver
 	}
+	if agentVer := strings.TrimSpace(reg.AgentVersion); agentVer != "" {
+		node.AgentVersion = agentVer
+	}
+	if hash := strings.TrimSpace(reg.NodeKeyHash); hash != "" {
+		keyChanged := false
+		if hash != node.NodeKeyHash {
+			node.NodeKeyHash = hash
+			keyChanged = true
+		}
+		if reg.NodeKeyVersion > 0 {
+			if reg.NodeKeyVersion != node.NodeKeyVersion {
+				node.NodeKeyVersion = reg.NodeKeyVersion
+			}
+		} else if node.NodeKeyVersion == 0 && keyChanged {
+			node.NodeKeyVersion = 1
+		}
+	}
 	node.LastSeen = now
 	node.UpdatedAt = now
+	if node.AgentDesiredVersion != "" && node.AgentVersion != "" && node.AgentDesiredVersion == node.AgentVersion {
+		node.AgentDesiredVersion = ""
+		node.LastUpgradeAt = now
+	}
 
 	payload, err := json.Marshal(node)
 	if err != nil {
@@ -532,6 +554,13 @@ func (e *EtcdStore) RegisterOrUpdateNode(reg NodeRegistration) (ConfigSnapshot, 
 
 // UpdateNodeGroup moves a node into another group.
 func (e *EtcdStore) UpdateNodeGroup(nodeID, groupID string) (ConfigSnapshot, EdgeNode, error) {
+	gid := groupID
+	update := NodeUpdate{GroupID: &gid}
+	return e.UpdateNode(nodeID, update)
+}
+
+// UpdateNode mutates persisted node metadata.
+func (e *EtcdStore) UpdateNode(nodeID string, update NodeUpdate) (ConfigSnapshot, EdgeNode, error) {
 	ctx, cancel := e.withCtx(context.Background())
 	defer cancel()
 
@@ -543,30 +572,64 @@ func (e *EtcdStore) UpdateNodeGroup(nodeID, groupID string) (ConfigSnapshot, Edg
 		return ConfigSnapshot{}, EdgeNode{}, err
 	}
 
-	targetID := strings.TrimSpace(groupID)
-	if targetID == "" {
-		targetID = defaultWaitingGroupID
-	}
-
-	group, err := e.getNodeGroup(ctx, targetID)
-	if err != nil {
-		if errors.Is(err, ErrNotFound) {
-			return ConfigSnapshot{}, EdgeNode{}, ErrGroupNotFound
+	changed := false
+	if update.GroupID != nil {
+		targetID := strings.TrimSpace(*update.GroupID)
+		var group NodeGroup
+		if targetID == "" {
+			group, err = e.ensureSystemGroup(NodeCategoryWaiting)
+		} else {
+			group, err = e.getNodeGroup(ctx, targetID)
 		}
-		return ConfigSnapshot{}, EdgeNode{}, err
+		if err != nil {
+			if errors.Is(err, ErrNotFound) {
+				return ConfigSnapshot{}, EdgeNode{}, ErrGroupNotFound
+			}
+			return ConfigSnapshot{}, EdgeNode{}, err
+		}
+		if node.GroupID != group.ID {
+			node.GroupID = group.ID
+			node.Category = group.Category
+			changed = true
+		}
+	}
+	if update.Name != nil {
+		name := strings.TrimSpace(*update.Name)
+		if node.Name != name {
+			node.Name = name
+			changed = true
+		}
+	}
+	if update.Category != nil {
+		category := *update.Category
+		var group NodeGroup
+		group, err = e.ensureSystemGroup(category)
+		if err != nil {
+			return ConfigSnapshot{}, EdgeNode{}, err
+		}
+		if node.Category != category || node.GroupID != group.ID {
+			node.Category = category
+			node.GroupID = group.ID
+			changed = true
+		}
+	}
+	if update.AgentDesiredVersion != nil {
+		desired := strings.TrimSpace(*update.AgentDesiredVersion)
+		if node.AgentDesiredVersion != desired {
+			node.AgentDesiredVersion = desired
+			changed = true
+		}
 	}
 
-	node.GroupID = group.ID
-	node.Category = group.Category
-	node.UpdatedAt = time.Now().UTC()
-
-	payload, err := json.Marshal(node)
-	if err != nil {
-		return ConfigSnapshot{}, EdgeNode{}, fmt.Errorf("marshal node: %w", err)
-	}
-
-	if _, err = e.client.Put(ctx, e.nodeKey(node.ID), string(payload)); err != nil {
-		return ConfigSnapshot{}, EdgeNode{}, fmt.Errorf("put node: %w", err)
+	if changed {
+		node.UpdatedAt = time.Now().UTC()
+		payload, err := json.Marshal(node)
+		if err != nil {
+			return ConfigSnapshot{}, EdgeNode{}, fmt.Errorf("marshal node: %w", err)
+		}
+		if _, err = e.client.Put(ctx, e.nodeKey(node.ID), string(payload)); err != nil {
+			return ConfigSnapshot{}, EdgeNode{}, fmt.Errorf("put node: %w", err)
+		}
 	}
 
 	snap, err := e.Snapshot(context.Background())
@@ -574,6 +637,26 @@ func (e *EtcdStore) UpdateNodeGroup(nodeID, groupID string) (ConfigSnapshot, Edg
 		return ConfigSnapshot{}, EdgeNode{}, err
 	}
 	return snap, node, nil
+}
+
+// DeleteNode removes a node definition and invalidates its key.
+func (e *EtcdStore) DeleteNode(nodeID string) (ConfigSnapshot, error) {
+	ctx, cancel := e.withCtx(context.Background())
+	defer cancel()
+
+	resp, err := e.client.Delete(ctx, e.nodeKey(nodeID))
+	if err != nil {
+		return ConfigSnapshot{}, fmt.Errorf("delete node: %w", err)
+	}
+	if resp.Deleted == 0 {
+		return ConfigSnapshot{}, ErrNodeNotFound
+	}
+
+	snap, err := e.Snapshot(context.Background())
+	if err != nil {
+		return ConfigSnapshot{}, err
+	}
+	return snap, nil
 }
 
 // Snapshot reads all configuration entries from etcd.
@@ -997,6 +1080,10 @@ func (e *EtcdStore) nodeGroupKey(id string) string {
 
 func (e *EtcdStore) nodeKey(id string) string {
 	return e.prefix + nodesDir + id
+}
+
+func (e *EtcdStore) managementVersionKey() string {
+	return e.prefix + metaDir + "management_version"
 }
 
 func (e *EtcdStore) nodeGroupsPrefix() string {

@@ -18,6 +18,15 @@ type tunnelServerManager struct {
 type tunnelServerInstance struct {
 	cancel   context.CancelFunc
 	keystore *snapshotKeyStore
+	server   *tserver.Server
+	groupID  string
+}
+
+type tunnelServerPlan struct {
+	ingressAddr string
+	groupID     string
+	routes      []tserver.RouteConfig
+	sessions    map[string]tserver.SessionInfo
 }
 
 func newTunnelServerManager(logger Logger) *tunnelServerManager {
@@ -30,7 +39,7 @@ func newTunnelServerManager(logger Logger) *tunnelServerManager {
 	}
 }
 
-func (m *tunnelServerManager) Update(ctx context.Context, plans map[string]map[string]tserver.SessionInfo) error {
+func (m *tunnelServerManager) Update(ctx context.Context, plans map[string]tunnelServerPlan) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -43,15 +52,19 @@ func (m *tunnelServerManager) Update(ctx context.Context, plans map[string]map[s
 	}
 
 	// start or update required servers
-	for addr, keys := range plans {
+	for addr, plan := range plans {
 		if inst, ok := m.servers[addr]; ok {
-			inst.keystore.Update(keys)
+			inst.keystore.Update(plan.sessions)
+			if err := inst.server.UpdateConfig(tserver.Config{GroupID: plan.groupID, Routes: plan.routes}); err != nil {
+				m.logger.Printf("[edge] tunnel server config update failed addr=%s err=%v", addr, err)
+			}
 			continue
 		}
 		ks := newSnapshotKeyStore()
-		ks.Update(keys)
+		ks.Update(plan.sessions)
 		srv, err := tserver.New(tserver.Options{
 			ListenAddr: addr,
+			GroupID:    plan.groupID,
 			Logger:     m.logger,
 			KeyStore:   ks,
 		})
@@ -59,10 +72,16 @@ func (m *tunnelServerManager) Update(ctx context.Context, plans map[string]map[s
 			m.logger.Printf("[edge] start tunnel server failed addr=%s err=%v", addr, err)
 			continue
 		}
+		if err := srv.UpdateConfig(tserver.Config{GroupID: plan.groupID, Routes: plan.routes}); err != nil {
+			m.logger.Printf("[edge] tunnel server initial config failed addr=%s err=%v", addr, err)
+			continue
+		}
 		srvCtx, cancel := context.WithCancel(ctx)
 		m.servers[addr] = &tunnelServerInstance{
 			cancel:   cancel,
 			keystore: ks,
+			server:   srv,
+			groupID:  plan.groupID,
 		}
 		go func(addr string) {
 			if err := srv.Serve(srvCtx); err != nil && !errors.Is(err, context.Canceled) {

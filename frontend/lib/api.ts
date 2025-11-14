@@ -13,10 +13,14 @@ import type {
   RewriteActions,
   RewriteRule,
   SSLPolicy,
+  TunnelAgent,
+  TunnelAgentService,
+  TunnelGroup,
   TunnelRoute,
   Upstream,
   UpstreamOverride,
   URLRewrite,
+  RouteListener,
 } from "./types"
 
 function resolveControlPlaneURL(): string {
@@ -29,6 +33,13 @@ function resolveControlPlaneURL(): string {
     return window.location.origin
   }
   return (process.env.CONTROL_PLANE_API_URL ?? "").trim()
+}
+
+
+function httpError(res: Response, message: string): Error & { status: number } {
+  const err = new Error(message) as Error & { status: number }
+  err.status = res.status
+  return err
 }
 
 function generateId(): string {
@@ -249,9 +260,13 @@ function normaliseEdgeNode(raw: any): EdgeNode {
     groupId: toStringValue(raw?.groupId) ?? "",
     category: normaliseNodeCategory(raw?.category),
     kind: toStringValue(raw?.kind) ?? "edge",
+    name: toStringValue(raw?.name),
     hostname: toStringValue(raw?.hostname),
     addresses: toStringArray(raw?.addresses).filter((addr) => addr.length > 0),
     version: toStringValue(raw?.version),
+    agentVersion: toStringValue(raw?.agentVersion),
+    agentDesiredVersion: toStringValue(raw?.agentDesiredVersion),
+    lastUpgradeAt: toStringValue(raw?.lastUpgradeAt),
     lastSeen: toStringValue(raw?.lastSeen),
     createdAt: toStringValue(raw?.createdAt),
     updatedAt: toStringValue(raw?.updatedAt),
@@ -269,6 +284,22 @@ function normaliseUpstream(raw: any): Upstream {
   }
 }
 
+function normaliseListenerArray(raw: any): RouteListener[] {
+  if (!Array.isArray(raw)) {
+    return []
+  }
+  return raw
+    .map((item: any) => {
+      const protocol = toStringValue(item?.protocol)?.toUpperCase() === "HTTPS" ? "HTTPS" : "HTTP"
+      const portNumber = Number(item?.port ?? 0)
+      return {
+        protocol,
+        port: Number.isFinite(portNumber) && portNumber > 0 ? portNumber : undefined,
+      }
+    })
+    .filter((item) => item.protocol)
+}
+
 function normaliseDomain(raw: any): DomainRoute {
   const upstreams = Array.isArray(raw?.upstreams) ? raw.upstreams.map(normaliseUpstream) : []
   return {
@@ -283,6 +314,13 @@ function normaliseDomain(raw: any): DomainRoute {
           timeoutProxy: toNumber(raw.metadata.timeoutProxy),
           timeoutRead: toNumber(raw.metadata.timeoutRead),
           timeoutSend: toNumber(raw.metadata.timeoutSend),
+          displayName: toStringValue(raw.metadata.displayName),
+          groupName: toStringValue(raw.metadata.groupName),
+          remark: toStringValue(raw.metadata.remark),
+          forwardMode: toStringValue(raw.metadata.forwardMode),
+          loadBalancingAlgorithm: toStringValue(raw.metadata.loadBalancingAlgorithm),
+          inboundListeners: normaliseListenerArray(raw.metadata.inboundListeners),
+          outboundListeners: normaliseListenerArray(raw.metadata.outboundListeners),
         }
       : undefined,
     updatedAt: raw?.updatedAt ? String(raw.updatedAt) : undefined,
@@ -291,10 +329,13 @@ function normaliseDomain(raw: any): DomainRoute {
 
 function normaliseTunnel(raw: any): TunnelRoute {
   return {
-    id: String(raw?.id ?? randomUUID()),
+    id: String(raw?.id ?? generateId()),
+    groupId: String(raw?.groupId ?? ""),
     protocol: String(raw?.protocol ?? "tcp"),
     bindHost: String(raw?.bindHost ?? ""),
     bindPort: Number(raw?.bindPort ?? 0),
+    bridgeBind: raw?.bridgeBind ? String(raw.bridgeBind) : undefined,
+    bridgePort: raw?.bridgePort !== undefined ? Number(raw.bridgePort) : undefined,
     target: String(raw?.target ?? ""),
     nodeIds: Array.isArray(raw?.nodeIds) ? raw.nodeIds.map((n: any) => String(n)) : [],
     idleTimeout: toNumber(raw?.idleTimeout),
@@ -305,6 +346,46 @@ function normaliseTunnel(raw: any): TunnelRoute {
         }
       : undefined,
     updatedAt: raw?.updatedAt ? String(raw.updatedAt) : undefined,
+  }
+}
+
+function normaliseTunnelGroup(raw: any): TunnelGroup {
+  return {
+    id: String(raw?.id ?? generateId()),
+    name: String(raw?.name ?? ""),
+    description: toStringValue(raw?.description),
+    listenAddress: String(raw?.listenAddress ?? ""),
+    edgeNodeIds: toStringArray(raw?.edgeNodeIds),
+    transports: toStringArray(raw?.transports),
+    enableCompress: Boolean(raw?.enableCompress),
+    createdAt: toStringValue(raw?.createdAt),
+    updatedAt: toStringValue(raw?.updatedAt),
+  }
+}
+
+function normaliseTunnelAgentService(raw: any): TunnelAgentService {
+  return {
+    id: String(raw?.id ?? generateId()),
+    protocol: toStringValue(raw?.protocol)?.toLowerCase() ?? "tcp",
+    localAddress: String(raw?.localAddress ?? "127.0.0.1"),
+    localPort: Number(raw?.localPort ?? raw?.remotePort ?? 0),
+    remotePort: Number(raw?.remotePort ?? 0),
+    enableCompression: Boolean(raw?.enableCompression),
+    description: toStringValue(raw?.description),
+  }
+}
+
+function normaliseTunnelAgent(raw: any): TunnelAgent {
+  return {
+    id: String(raw?.id ?? generateId()),
+    nodeId: String(raw?.nodeId ?? ""),
+    groupId: String(raw?.groupId ?? ""),
+    description: toStringValue(raw?.description),
+    keyVersion: Number(raw?.keyVersion ?? 1),
+    enabled: raw?.enabled !== false,
+    services: Array.isArray(raw?.services) ? raw.services.map(normaliseTunnelAgentService) : [],
+    createdAt: toStringValue(raw?.createdAt),
+    updatedAt: toStringValue(raw?.updatedAt),
   }
 }
 
@@ -337,10 +418,204 @@ export async function fetchNodeGroups(token: string): Promise<NodeGroup[]> {
   })
   if (!response.ok) {
     const detail = await response.json().catch(() => ({}))
-    throw new Error(detail?.error || `加载节点分组失败：${response.statusText}`)
+    throw httpError(response, detail?.error || `加载节点分组失败：${response.statusText}`)
   }
   const data = await response.json()
   return Array.isArray(data?.groups) ? data.groups.map(normaliseNodeGroup) : []
+}
+
+export interface TunnelGroupPayload {
+  name: string
+  description?: string
+  listenAddress?: string
+  edgeNodeIds?: string[]
+  transports?: string[]
+  enableCompress?: boolean
+}
+
+export async function fetchTunnelGroups(token: string): Promise<TunnelGroup[]> {
+  const url = new URL("/v1/tunnel-groups", resolveControlPlaneURL())
+  const res = await fetch(url.toString(), {
+    headers: { Authorization: `Bearer ${token}` },
+    credentials: "include",
+  })
+  if (!res.ok) {
+    const detail = await res.json().catch(() => ({}))
+    throw httpError(res, detail?.error || `加载隧道分组失败：${res.statusText}`)
+  }
+  const data = await res.json()
+  return Array.isArray(data?.groups) ? data.groups.map(normaliseTunnelGroup) : []
+}
+
+export async function createTunnelGroupRequest(token: string, payload: TunnelGroupPayload): Promise<TunnelGroup> {
+  const url = new URL("/v1/tunnel-groups", resolveControlPlaneURL())
+  const res = await fetch(url.toString(), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    credentials: "include",
+    body: JSON.stringify(payload),
+  })
+  if (!res.ok) {
+    const detail = await res.json().catch(() => ({}))
+    throw httpError(res, detail?.error || `创建隧道分组失败：${res.statusText}`)
+  }
+  const data = await res.json()
+  return normaliseTunnelGroup(data?.group)
+}
+
+export async function updateTunnelGroupRequest(
+  token: string,
+  id: string,
+  payload: TunnelGroupPayload,
+): Promise<TunnelGroup> {
+  const url = new URL(`/v1/tunnel-groups/${id}`, resolveControlPlaneURL())
+  const res = await fetch(url.toString(), {
+    method: "PATCH",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    credentials: "include",
+    body: JSON.stringify(payload),
+  })
+  if (!res.ok) {
+    const detail = await res.json().catch(() => ({}))
+    throw httpError(res, detail?.error || `更新隧道分组失败：${res.statusText}`)
+  }
+  const data = await res.json()
+  return normaliseTunnelGroup(data?.group)
+}
+
+export async function deleteTunnelGroupRequest(token: string, id: string): Promise<void> {
+  const url = new URL(`/v1/tunnel-groups/${id}`, resolveControlPlaneURL())
+  const res = await fetch(url.toString(), {
+    method: "DELETE",
+    headers: { Authorization: `Bearer ${token}` },
+    credentials: "include",
+  })
+  if (!res.ok) {
+    const detail = await res.json().catch(() => ({}))
+    throw httpError(res, detail?.error || `删除隧道分组失败：${res.statusText}`)
+  }
+}
+
+export interface TunnelAgentPayload {
+  nodeId: string
+  groupId: string
+  description?: string
+  enabled?: boolean
+  rotateKey?: boolean
+  services: Array<{
+    id: string
+    protocol?: string
+    localAddress?: string
+    localPort?: number
+    remotePort: number
+    enableCompression?: boolean
+    description?: string
+  }>
+}
+
+type TunnelAgentResponse = { agent: TunnelAgent; agentKey?: string }
+
+export async function fetchTunnelAgents(token: string): Promise<TunnelAgent[]> {
+  const url = new URL("/v1/tunnel-agents", resolveControlPlaneURL())
+  const res = await fetch(url.toString(), {
+    headers: { Authorization: `Bearer ${token}` },
+    credentials: "include",
+  })
+  if (!res.ok) {
+    const detail = await res.json().catch(() => ({}))
+    throw httpError(res, detail?.error || `加载 Tunnel Agent 失败：${res.statusText}`)
+  }
+  const data = await res.json()
+  return Array.isArray(data?.agents) ? data.agents.map(normaliseTunnelAgent) : []
+}
+
+export async function createTunnelAgentRequest(
+  token: string,
+  payload: TunnelAgentPayload,
+): Promise<TunnelAgentResponse> {
+  const url = new URL("/v1/tunnel-agents", resolveControlPlaneURL())
+  const res = await fetch(url.toString(), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    credentials: "include",
+    body: JSON.stringify(payload),
+  })
+  if (!res.ok) {
+    const detail = await res.json().catch(() => ({}))
+    throw httpError(res, detail?.error || `创建 Tunnel Agent 失败：${res.statusText}`)
+  }
+  const data = await res.json()
+  return {
+    agent: normaliseTunnelAgent(data?.agent),
+    agentKey: toStringValue(data?.agentKey),
+  }
+}
+
+export async function updateTunnelAgentRequest(
+  token: string,
+  id: string,
+  payload: TunnelAgentPayload,
+): Promise<TunnelAgentResponse> {
+  const url = new URL(`/v1/tunnel-agents/${id}`, resolveControlPlaneURL())
+  const res = await fetch(url.toString(), {
+    method: "PATCH",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    credentials: "include",
+    body: JSON.stringify(payload),
+  })
+  if (!res.ok) {
+    const detail = await res.json().catch(() => ({}))
+    throw httpError(res, detail?.error || `更新 Tunnel Agent 失败：${res.statusText}`)
+  }
+  const data = await res.json()
+  return {
+    agent: normaliseTunnelAgent(data?.agent),
+    agentKey: toStringValue(data?.agentKey),
+  }
+}
+
+export async function deleteTunnelAgentRequest(token: string, id: string): Promise<void> {
+  const url = new URL(`/v1/tunnel-agents/${id}`, resolveControlPlaneURL())
+  const res = await fetch(url.toString(), {
+    method: "DELETE",
+    headers: { Authorization: `Bearer ${token}` },
+    credentials: "include",
+  })
+  if (!res.ok) {
+    const detail = await res.json().catch(() => ({}))
+    throw httpError(res, detail?.error || `删除 Tunnel Agent 失败：${res.statusText}`)
+  }
+}
+
+export async function refreshTunnelAgentKeyRequest(token: string, id: string): Promise<string> {
+  const url = new URL(`/v1/tunnel-agents/${id}/refresh-key`, resolveControlPlaneURL())
+  const res = await fetch(url.toString(), {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    credentials: "include",
+  })
+  if (!res.ok) {
+    const detail = await res.json().catch(() => ({}))
+    throw httpError(res, detail?.error || `刷新密钥失败：${res.statusText}`)
+  }
+  const data = await res.json()
+  const key = toStringValue(data?.agentKey)
+  if (!key) {
+    throw new Error("控制面未返回新的 agentKey")
+  }
+  return key
 }
 
 export interface NodeInventory {
@@ -358,7 +633,7 @@ export async function fetchNodeInventory(token: string): Promise<NodeInventory> 
     credentials: "include",
   })
   if (!response.ok) {
-    throw new Error(`加载节点失败：${response.statusText}`)
+    throw httpError(response, `加载节点失败：${response.statusText}`)
   }
 
   const data = await response.json()
@@ -369,6 +644,40 @@ export async function fetchNodeInventory(token: string): Promise<NodeInventory> 
     groups,
     version: Number(data?.version ?? 0),
   }
+}
+
+export interface AgentVersionListing {
+  versions: string[]
+  latestResolved?: string
+}
+
+export async function fetchAgentVersions(token: string): Promise<AgentVersionListing> {
+  const url = new URL("/v1/agent-versions", resolveControlPlaneURL())
+  const response = await fetch(url.toString(), {
+    headers: {
+      Authorization: `Bearer ${token}`,
+    },
+    credentials: "include",
+  })
+  if (!response.ok) {
+    throw httpError(response, `加载 Agent 版本列表失败：${response.statusText}`)
+  }
+  const data = await response.json()
+  const rawList = Array.isArray(data?.versions) ? data.versions.map((item: any) => String(item ?? "").trim()) : []
+  const seen = new Set<string>()
+  const ordered: string[] = []
+  const add = (value: string) => {
+    if (!value || seen.has(value)) return
+    seen.add(value)
+    ordered.push(value)
+  }
+  add("latest")
+  rawList.forEach(add)
+  if (ordered.length === 0) {
+    ordered.push("latest")
+  }
+  const latestResolved = typeof data?.latest === "string" ? data.latest.trim() : ""
+  return { versions: ordered, latestResolved }
 }
 
 export async function createNodeGroupRequest(
@@ -391,7 +700,7 @@ export async function createNodeGroupRequest(
   })
   if (!response.ok) {
     const detail = await response.json().catch(() => ({}))
-    throw new Error(detail?.error || `创建分组失败：${response.statusText}`)
+    throw httpError(response, detail?.error || `创建分组失败：${response.statusText}`)
   }
   const data = await response.json()
   return normaliseNodeGroup(data?.group)
@@ -417,7 +726,7 @@ export async function updateNodeGroupRequest(
   })
   if (!response.ok) {
     const detail = await response.json().catch(() => ({}))
-    throw new Error(detail?.error || `更新分组失败：${response.statusText}`)
+    throw httpError(response, detail?.error || `更新分组失败：${response.statusText}`)
   }
   const data = await response.json()
   return normaliseNodeGroup(data?.group)
@@ -434,12 +743,42 @@ export async function deleteNodeGroupRequest(token: string, id: string): Promise
   })
   if (!response.ok) {
     const detail = await response.json().catch(() => ({}))
-    throw new Error(detail?.error || `删除分组失败：${response.statusText}`)
+    throw httpError(response, detail?.error || `删除分组失败：${response.statusText}`)
   }
 }
 
 export async function moveNodeToGroupRequest(token: string, nodeId: string, groupId: string | null): Promise<EdgeNode> {
+  return updateNodeRequest(token, nodeId, { groupId })
+}
+
+export async function updateNodeRequest(
+  token: string,
+  nodeId: string,
+  payload: {
+    groupId?: string | null
+    name?: string | null
+    category?: NodeCategory | null
+    agentDesiredVersion?: string | null
+  },
+): Promise<EdgeNode> {
   const url = new URL(`/v1/nodes/${nodeId}`, resolveControlPlaneURL())
+  const body: Record<string, string> = {}
+  if (payload.groupId !== undefined) {
+    body.groupId = payload.groupId ?? ""
+  }
+  if (payload.name !== undefined) {
+    body.name = payload.name ?? ""
+  }
+  if (payload.category !== undefined) {
+    body.category = payload.category ?? ""
+  }
+  if (payload.agentDesiredVersion !== undefined) {
+    body.agentDesiredVersion = payload.agentDesiredVersion ?? ""
+  }
+
+  if (Object.keys(body).length === 0) {
+    throw new Error("未提供可更新的节点字段")
+  }
   const response = await fetch(url.toString(), {
     method: "PATCH",
     headers: {
@@ -447,16 +786,55 @@ export async function moveNodeToGroupRequest(token: string, nodeId: string, grou
       Authorization: `Bearer ${token}`,
     },
     credentials: "include",
-    body: JSON.stringify({
-      groupId: groupId ?? undefined,
-    }),
+    body: JSON.stringify(body),
   })
   if (!response.ok) {
     const detail = await response.json().catch(() => ({}))
-    throw new Error(detail?.error || `调整分组失败：${response.statusText}`)
+    throw httpError(response, detail?.error || `更新节点失败：${response.statusText}`)
   }
   const data = await response.json()
   return normaliseEdgeNode(data?.node)
+}
+
+export async function deleteNodeRequest(token: string, nodeId: string): Promise<void> {
+  const url = new URL(`/v1/nodes/${nodeId}`, resolveControlPlaneURL())
+  const response = await fetch(url.toString(), {
+    method: "DELETE",
+    headers: {
+      Authorization: `Bearer ${token}`,
+    },
+    credentials: "include",
+  })
+  if (!response.ok) {
+    const detail = await response.json().catch(() => ({}))
+    throw httpError(response, detail?.error || `删除节点失败：${response.statusText}`)
+  }
+}
+
+export async function updateNodesDesiredVersionRequest(
+  token: string,
+  payload: { nodeIds: string[]; agentDesiredVersion: string | null },
+): Promise<{ updated: number }> {
+  const url = new URL("/v1/nodes/desired-version", resolveControlPlaneURL())
+  const body = {
+    nodeIds: payload.nodeIds,
+    agentDesiredVersion: payload.agentDesiredVersion ?? "",
+  }
+  const response = await fetch(url.toString(), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    credentials: "include",
+    body: JSON.stringify(body),
+  })
+  if (!response.ok) {
+    const detail = await response.json().catch(() => ({}))
+    throw httpError(response, detail?.error || `批量更新版本失败：${response.statusText}`)
+  }
+  const data = await response.json()
+  return { updated: Number(data?.updated ?? 0) }
 }
 
 export async function fetchSnapshot(token: string): Promise<ConfigSnapshot> {
@@ -494,5 +872,79 @@ export async function fetchSnapshot(token: string): Promise<ConfigSnapshot> {
       console.error("[frontend] failed to fetch snapshot:", error)
     }
     throw error
+  }
+}
+
+export interface DomainUpstreamInput {
+  address: string
+  weight?: number
+  maxFails?: number
+  failTimeout?: string
+  healthCheck?: string
+  usePersistent?: boolean
+}
+
+export interface DomainRequestPayload {
+  id?: string
+  domain: string
+  enableTls: boolean
+  edgeNodes?: string[]
+  upstreams: DomainUpstreamInput[]
+  metadata?: {
+    sticky?: boolean
+    timeoutProxy?: string
+    timeoutRead?: string
+    timeoutSend?: string
+    displayName?: string
+    groupName?: string
+  }
+}
+
+export async function createDomainRequest(token: string, payload: DomainRequestPayload): Promise<void> {
+  const url = new URL("/v1/domains", resolveControlPlaneURL())
+  const response = await fetch(url.toString(), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    credentials: "include",
+    body: JSON.stringify(payload),
+  })
+  if (!response.ok) {
+    const detail = await response.json().catch(() => ({}))
+    throw httpError(response, detail?.error || `创建应用代理失败：${response.statusText}`)
+  }
+}
+
+export async function updateDomainRequest(token: string, payload: DomainRequestPayload): Promise<void> {
+  const url = new URL("/v1/domains", resolveControlPlaneURL())
+  const response = await fetch(url.toString(), {
+    method: "PUT",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    credentials: "include",
+    body: JSON.stringify(payload),
+  })
+  if (!response.ok) {
+    const detail = await response.json().catch(() => ({}))
+    throw httpError(response, detail?.error || `更新应用代理失败：${response.statusText}`)
+  }
+}
+
+export async function deleteDomainRequest(token: string, id: string): Promise<void> {
+  const url = new URL(`/v1/domains/${id}`, resolveControlPlaneURL())
+  const response = await fetch(url.toString(), {
+    method: "DELETE",
+    headers: {
+      Authorization: `Bearer ${token}`,
+    },
+    credentials: "include",
+  })
+  if (!response.ok) {
+    const detail = await response.json().catch(() => ({}))
+    throw httpError(response, detail?.error || `删除应用代理失败：${response.statusText}`)
   }
 }

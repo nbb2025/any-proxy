@@ -12,6 +12,12 @@
 3. **Agent 与隧道协议骨架**
    - `edge-agent` 同时渲染 HTTP/HAProxy，并根据 `TunnelGroup` 自动拉起本地隧道服务端，动态校验 Key。
    - `internal/tunnel/protocol` + `client/server` 完成 handshake/heartbeat framing，`tunnel-agent` 侧已具备握手、心跳与重连基础逻辑。
+4. **Edge Agent 版本管理**
+   - 控制平面存储 `agentVersion/agentDesiredVersion`，前端可针对节点设置目标版本；`edge-agent` 会从 `/install/binaries/<version>/edge_linux_amd64.tar.gz` 下载新二进制并原地 `exec`，成功后记录最近升级时间。
+4. **隧道数据面 Stage 2A**
+   - `tunnel-server` 接入 HAProxy bridge 端口与控制/数据信道，支持按服务下发命令、令 `tunnel-agent` 主动建立数据通道。
+   - `tunnel-agent` 从控制面快照读取自身配置（group/edge candidates/services），使用 agent key 主动连接 edge 节点并完成双向转发。
+   - 安装脚本与 CLI 支持注入 `ANYPROXY_AGENT_KEY`、`ANYPROXY_EDGE_CANDIDATES` 等变量，自动持久化 key 并输出新的 systemd 单元。
 
 ## 下一步计划
 1. **隧道数据通道**：在 edge-agent 中将 HAProxy backend 接入 tunnel server，完成 TCP/UDP 双向流量转发；tunnel-agent 则根据配置监听本地端口，将数据封装到 QUIC/WebSocket 多路复用通道中。

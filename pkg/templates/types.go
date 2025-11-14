@@ -29,6 +29,16 @@ type EdgeDomain struct {
 	SendTimeout   string
 	EnablePersist bool
 	Upstreams     []EdgeUpstream
+	Remark        string
+	LoadBalancingAlgorithm string
+	InboundListeners        []Listener
+	OutboundListeners       []Listener
+	ProxyScheme             string
+}
+
+type Listener struct {
+	Protocol string
+	Port     int
 }
 
 // EdgeUpstream carries attributes for an upstream member.
